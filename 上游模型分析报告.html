@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Zen-Proxy 上游模型分析报告</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --card: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --dim: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --red: #f85149;
+    --purple: #bc8cff;
+    --orange: #f0883e;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    padding: 24px;
+  }
+  h1 {
+    font-size: 24px;
+    margin-bottom: 8px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--dim); font-size: 13px; margin-bottom: 24px; }
+  h2 {
+    font-size: 18px;
+    margin: 28px 0 12px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  h2 .badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-weight: 600;
+  }
+  h3 { font-size: 15px; margin: 20px 0 10px; color: var(--accent); }
+  .summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+  .stat-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  .stat-card .label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: 1px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; margin-top: 4px; }
+  .stat-card .desc { font-size: 12px; color: var(--dim); margin-top: 4px; }
+  .stat-card.green .value { color: var(--green); }
+  .stat-card.yellow .value { color: var(--yellow); }
+  .stat-card.red .value { color: var(--red); }
+  .stat-card.accent .value { color: var(--accent); }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-bottom: 16px;
+    font-size: 13px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--card);
+    color: var(--dim);
+    font-weight: 600;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    position: sticky;
+    top: 0;
+  }
+  tr:hover td { background: rgba(88,166,255,0.05); }
+  td code {
+    background: rgba(110,118,129,0.2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: var(--accent);
+  }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .tag-free { background: rgba(63,185,80,0.15); color: var(--green); }
+  .tag-paid { background: rgba(210,153,34,0.15); color: var(--yellow); }
+  .tag-deprecated { background: rgba(248,81,73,0.15); color: var(--red); }
+  .tag-used { background: rgba(88,166,255,0.15); color: var(--accent); }
+  .tag-listed { background: rgba(188,140,255,0.15); color: var(--purple); }
+
+  .alert {
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+    font-size: 13px;
+    border: 1px solid;
+  }
+  .alert-warning {
+    background: rgba(210,153,34,0.08);
+    border-color: rgba(210,153,34,0.3);
+    color: var(--yellow);
+  }
+  .alert-info {
+    background: rgba(88,166,255,0.08);
+    border-color: rgba(88,166,255,0.3);
+    color: var(--accent);
+  }
+  .alert-danger {
+    background: rgba(248,81,73,0.08);
+    border-color: rgba(248,81,73,0.3);
+    color: var(--red);
+  }
+  .alert b { color: var(--text); }
+
+  .arch-box {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.8;
+    overflow-x: auto;
+  }
+  .arch-box .arrow { color: var(--green); }
+  .arch-box .label { color: var(--dim); }
+  .arch-box .highlight { color: var(--yellow); }
+  .arch-box .force { color: var(--red); font-weight: bold; }
+
+  .footnote { color: var(--dim); font-size: 11px; margin-top: 24px; border-top: 1px solid var(--border); padding-top: 12px; }
+  .footnote a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+
+<h1>Zen-Proxy 上游模型分析报告</h1>
+<p class="subtitle">分析日期:2026-08-02 · 数据来源:项目源码 + OpenCode 官方文档</p>
+
+<!-- 核心结论 -->
+<div class="summary-grid">
+  <div class="stat-card green">
+    <div class="label">上游免费模型</div>
+    <div class="value">7</div>
+    <div class="desc">OpenCode Zen 限时免费</div>
+  </div>
+  <div class="stat-card yellow">
+    <div class="label">上游付费模型</div>
+    <div class="value">54</div>
+    <div class="desc">按量付费 (pay-as-you-go)</div>
+  </div>
+  <div class="stat-card accent">
+    <div class="label">项目白名单</div>
+    <div class="value">7</div>
+    <div class="desc">gateway.js 中 FREE_MODELS</div>
+  </div>
+  <div class="stat-card red">
+    <div class="label">实际可用</div>
+    <div class="value">1</div>
+    <div class="desc">强制固定为 deepseek-v4-flash-free</div>
+  </div>
+</div>
+
+<!-- 架构说明 -->
+<h2>项目架构与模型流向</h2>
+<div class="arch-box">
+<span class="label">客户端 (Cursor/Cline/Claude Code)</span>
+  <span class="arrow">──POST /v1/chat/completions──▶</span> <span class="label">本地 Gateway (gateway.js :9527)</span>
+                                                            │
+                                                            │  <span class="force">body.model = FIXED_MODEL  // 强制覆盖,忽略客户端传入</span>
+                                                            │  <span class="force">FIXED_MODEL = 'deepseek-v4-flash-free'</span>
+                                                            ↓
+                                                    <span class="label">mihomo 代理 (:17897)</span>
+                                                            │
+                                                            <span class="arrow">──HTTPS──▶</span> <span class="highlight">opencode.ai/zen/v1/chat/completions</span>
+                                                            │
+                                                            <span class="arrow">◀──SSE/JSON──</span> 响应原样透传
+</div>
+
+<div class="alert alert-danger">
+  <b>关键发现:</b> 虽然项目的 <code>/v1/models</code> 接口返回 7 个免费模型,但 <code>handleChat()</code> 中有一行
+  <code>body.model = FIXED_MODEL</code> 会<b>强制覆盖</b>客户端传入的任何模型名。
+  因此无论客户端请求哪个模型,实际上游请求始终只发 <code>deepseek-v4-flash-free</code>。
+</div>
+
+<!-- 项目代码中的模型 -->
+<h2>项目代码层面 <span class="badge tag-listed">gateway.js</span></h2>
+
+<h3>FREE_MODELS 白名单(供 /v1/models 返回)</h3>
+<table>
+  <thead>
+    <tr><th>#</th><th>模型 ID</th><th>状态</th><th>说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td><code>deepseek-v4-flash-free</code></td><td><span class="tag tag-used">实际使用</span></td><td>FIXED_MODEL,所有请求强制使用此模型</td></tr>
+    <tr><td>2</td><td><code>big-pickle</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用(会被覆盖)</td></tr>
+    <tr><td>3</td><td><code>mimo-v2.5-free</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用</td></tr>
+    <tr><td>4</td><td><code>laguna-s-2.1-free</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用</td></tr>
+    <tr><td>5</td><td><code>ling-3.0-flash-free</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用</td></tr>
+    <tr><td>6</td><td><code>north-mini-code-free</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用</td></tr>
+    <tr><td>7</td><td><code>nemotron-3-ultra-free</code></td><td><span class="tag tag-listed">仅展示</span></td><td>/v1/models 返回但不可用</td></tr>
+  </tbody>
+</table>
+
+<div class="alert alert-info">
+  <b>代码位置:</b> <code>desktop-app/gateway.js</code> 第 27 行 <code>FIXED_MODEL</code>、第 33-41 行 <code>FREE_MODELS</code>、第 222 行强制覆盖逻辑。
+</div>
+
+<!-- 上游全部模型 -->
+<h2>上游 OpenCode Zen 全部模型 <span class="badge tag-free">7 免费 + 54 付费</span></h2>
+
+<h3>免费模型(限时免费,无需付费)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>上下文</th><th>最大输出</th><th>厂商</th><th>隐私说明</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Big Pickle</td><td><code>big-pickle</code></td><td>200K</td><td>128K</td><td>🥒 隐身模型</td><td>数据可能用于改进模型</td></tr>
+    <tr><td>DeepSeek V4 Flash Free</td><td><code>deepseek-v4-flash-free</code></td><td>200K</td><td>128K</td><td>DeepSeek</td><td>数据可能用于改进模型</td></tr>
+    <tr><td>MiMo-V2.5 Free</td><td><code>mimo-v2.5-free</code></td><td>200K</td><td>128K</td><td>小米 (Xiaomi)</td><td>数据可能用于改进模型</td></tr>
+    <tr><td>Laguna S 2.1 Free</td><td><code>laguna-s-2.1-free</code></td><td>—</td><td>—</td><td>—</td><td>数据可能用于改进模型</td></tr>
+    <tr><td>Ling-3.0-flash Free</td><td><code>ling-3.0-flash-free</code></td><td>—</td><td>—</td><td>—</td><td>数据可能用于改进模型</td></tr>
+    <tr><td>North Mini Code Free</td><td><code>north-mini-code-free</code></td><td>131K</td><td>131K</td><td>Cohere</td><td>数据保留并用于改进,勿提交敏感数据</td></tr>
+    <tr><td>Nemotron 3 Ultra Free</td><td><code>nemotron-3-ultra-free</code></td><td>—</td><td>—</td><td>NVIDIA</td><td>仅试用,会记录使用情况</td></tr>
+  </tbody>
+</table>
+
+<h3>付费模型 — GPT 系列(OpenAI,端点 /v1/responses)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>输入 $/1M</th><th>输出 $/1M</th><th>缓存读 $/1M</th><th>备注</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>GPT 5.6 Sol</td><td><code>gpt-5.6-sol</code></td><td>$5.00 / $10.00</td><td>$30.00 / $45.00</td><td>$0.50 / $1.00</td><td>≤272K / &gt;272K 分段计价</td></tr>
+    <tr><td>GPT 5.6 Terra</td><td><code>gpt-5.6-terra</code></td><td>$2.00 / $4.00</td><td>$12.00 / $18.00</td><td>$0.20 / $0.40</td><td>≤272K / &gt;272K 分段计价</td></tr>
+    <tr><td>GPT 5.6 Luna</td><td><code>gpt-5.6-luna</code></td><td>$0.20 / $0.40</td><td>$1.20 / $1.80</td><td>$0.02 / $0.04</td><td>≤272K / &gt;272K 分段计价</td></tr>
+    <tr><td>GPT 5.5</td><td><code>gpt-5.5</code></td><td>$5.00 / $10.00</td><td>$30.00 / $45.00</td><td>$0.50 / $1.00</td><td>≤272K / &gt;272K 分段计价</td></tr>
+    <tr><td>GPT 5.5 Pro</td><td><code>gpt-5.5-pro</code></td><td>$30.00</td><td>$180.00</td><td>$30.00</td><td>旗舰</td></tr>
+    <tr><td>GPT 5.4</td><td><code>gpt-5.4</code></td><td>$2.50 / $5.00</td><td>$15.00 / $22.50</td><td>$0.25 / $0.50</td><td>≤272K / &gt;272K 分段计价</td></tr>
+    <tr><td>GPT 5.4 Pro</td><td><code>gpt-5.4-pro</code></td><td>$30.00</td><td>$180.00</td><td>$30.00</td><td>旗舰</td></tr>
+    <tr><td>GPT 5.4 Mini</td><td><code>gpt-5.4-mini</code></td><td>$0.75</td><td>$4.50</td><td>$0.075</td><td></td></tr>
+    <tr><td>GPT 5.4 Nano</td><td><code>gpt-5.4-nano</code></td><td>$0.20</td><td>$1.25</td><td>$0.02</td><td>最低成本</td></tr>
+    <tr><td>GPT 5.3 Codex</td><td><code>gpt-5.3-codex</code></td><td>$1.75</td><td>$14.00</td><td>$0.175</td><td></td></tr>
+    <tr><td>GPT 5.3 Codex Spark</td><td><code>gpt-5.3-codex-spark</code></td><td>$1.75</td><td>$14.00</td><td>$0.175</td><td></td></tr>
+    <tr><td>GPT 5.2</td><td><code>gpt-5.2</code></td><td>$1.75</td><td>$14.00</td><td>$0.175</td><td></td></tr>
+    <tr><td>GPT 5.2 Codex</td><td><code>gpt-5.2-codex</code></td><td>$1.75</td><td>$14.00</td><td>$0.175</td><td><span class="tag tag-deprecated">已弃用 2026-07-23</span></td></tr>
+    <tr><td>GPT 5.1</td><td><code>gpt-5.1</code></td><td>$1.07</td><td>$8.50</td><td>$0.107</td><td></td></tr>
+    <tr><td>GPT 5.1 Codex</td><td><code>gpt-5.1-codex</code></td><td>$1.07</td><td>$8.50</td><td>$0.107</td><td><span class="tag tag-deprecated">已弃用 2026-07-23</span></td></tr>
+    <tr><td>GPT 5.1 Codex Max</td><td><code>gpt-5.1-codex-max</code></td><td>$1.25</td><td>$10.00</td><td>$0.125</td><td><span class="tag tag-deprecated">已弃用 2026-07-23</span></td></tr>
+    <tr><td>GPT 5.1 Codex Mini</td><td><code>gpt-5.1-codex-mini</code></td><td>$0.25</td><td>$2.00</td><td>$0.025</td><td><span class="tag tag-deprecated">已弃用 2026-07-23</span></td></tr>
+    <tr><td>GPT 5</td><td><code>gpt-5</code></td><td>$1.07</td><td>$8.50</td><td>$0.107</td><td></td></tr>
+    <tr><td>GPT 5 Codex</td><td><code>gpt-5-codex</code></td><td>$1.07</td><td>$8.50</td><td>$0.107</td><td><span class="tag tag-deprecated">已弃用 2026-07-23</span></td></tr>
+    <tr><td>GPT 5 Nano</td><td><code>gpt-5-nano</code></td><td>$0.05</td><td>$0.40</td><td>$0.005</td><td>最低成本</td></tr>
+  </tbody>
+</table>
+
+<h3>付费模型 — Claude 系列(Anthropic,端点 /v1/messages)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>输入 $/1M</th><th>输出 $/1M</th><th>缓存读 $/1M</th><th>缓存写 $/1M</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Claude Fable 5</td><td><code>claude-fable-5</code></td><td>$10.00</td><td>$50.00</td><td>$1.00</td><td>$12.50</td></tr>
+    <tr><td>Claude Opus 5</td><td><code>claude-opus-5</code></td><td>$5.00</td><td>$25.00</td><td>$0.50</td><td>$6.25</td></tr>
+    <tr><td>Claude Opus 4.8</td><td><code>claude-opus-4-8</code></td><td>$5.00</td><td>$25.00</td><td>$0.50</td><td>$6.25</td></tr>
+    <tr><td>Claude Opus 4.7</td><td><code>claude-opus-4-7</code></td><td>$5.00</td><td>$25.00</td><td>$0.50</td><td>$6.25</td></tr>
+    <tr><td>Claude Opus 4.6</td><td><code>claude-opus-4-6</code></td><td>$5.00</td><td>$25.00</td><td>$0.50</td><td>$6.25</td></tr>
+    <tr><td>Claude Opus 4.5</td><td><code>claude-opus-4-5</code></td><td>$5.00</td><td>$25.00</td><td>$0.50</td><td>$6.25</td></tr>
+    <tr><td>Claude Sonnet 5</td><td><code>claude-sonnet-5</code></td><td>$2.00</td><td>$10.00</td><td>$0.20</td><td>$2.50</td></tr>
+    <tr><td>Claude Sonnet 4.6</td><td><code>claude-sonnet-4-6</code></td><td>$3.00</td><td>$15.00</td><td>$0.30</td><td>$3.75</td></tr>
+    <tr><td>Claude Sonnet 4.5 (≤200K)</td><td><code>claude-sonnet-4-5</code></td><td>$3.00</td><td>$15.00</td><td>$0.30</td><td>$3.75</td></tr>
+    <tr><td>Claude Sonnet 4.5 (&gt;200K)</td><td><code>claude-sonnet-4-5</code></td><td>$6.00</td><td>$22.50</td><td>$0.60</td><td>$7.50</td></tr>
+    <tr><td>Claude Haiku 4.5</td><td><code>claude-haiku-4-5</code></td><td>$1.00</td><td>$5.00</td><td>$0.10</td><td>$1.25</td></tr>
+  </tbody>
+</table>
+
+<h3>付费模型 — Gemini 系列(Google,端点 /v1/models/*)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>输入 $/1M</th><th>输出 $/1M</th><th>缓存读 $/1M</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Gemini 3.6 Flash</td><td><code>gemini-3.6-flash</code></td><td>$1.50</td><td>$7.50</td><td>$0.15</td></tr>
+    <tr><td>Gemini 3.5 Flash</td><td><code>gemini-3.5-flash</code></td><td>$1.50</td><td>$9.00</td><td>$0.15</td></tr>
+    <tr><td>Gemini 3.5 Flash Lite</td><td><code>gemini-3.5-flash-lite</code></td><td>$0.30</td><td>$2.50</td><td>$0.03</td></tr>
+    <tr><td>Gemini 3.1 Pro (≤200K)</td><td><code>gemini-3.1-pro</code></td><td>$2.00</td><td>$12.00</td><td>$0.20</td></tr>
+    <tr><td>Gemini 3.1 Pro (&gt;200K)</td><td><code>gemini-3.1-pro</code></td><td>$4.00</td><td>$18.00</td><td>$0.40</td></tr>
+    <tr><td>Gemini 3 Flash</td><td><code>gemini-3-flash</code></td><td>$0.50</td><td>$3.00</td><td>$0.05</td></tr>
+  </tbody>
+</table>
+
+<h3>付费模型 — Grok 系列(xAI,端点 /v1/chat/completions)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>输入 $/1M</th><th>输出 $/1M</th><th>缓存读 $/1M</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Grok 4.5 (≤200K)</td><td><code>grok-4.5</code></td><td>$2.00</td><td>$6.00</td><td>$0.30</td></tr>
+    <tr><td>Grok 4.5 (&gt;200K)</td><td><code>grok-4.5</code></td><td>$4.00</td><td>$12.00</td><td>$0.60</td></tr>
+    <tr><td>Grok Build 0.1</td><td><code>grok-build-0.1</code></td><td>$1.00</td><td>$2.00</td><td>$0.20</td></tr>
+  </tbody>
+</table>
+
+<h3>付费模型 — 国产模型(端点 /v1/chat/completions 或 /v1/messages)</h3>
+<table>
+  <thead>
+    <tr><th>模型名称</th><th>模型 ID</th><th>输入 $/1M</th><th>输出 $/1M</th><th>缓存读 $/1M</th><th>端点</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>DeepSeek V4 Pro</td><td><code>deepseek-v4-pro</code></td><td>$1.74</td><td>$3.48</td><td>$0.145</td><td>/chat/completions</td></tr>
+    <tr><td>DeepSeek V4 Flash</td><td><code>deepseek-v4-flash</code></td><td>$0.14</td><td>$0.28</td><td>$0.028</td><td>/chat/completions</td></tr>
+    <tr><td>Qwen3.7 Max</td><td><code>qwen3.7-max</code></td><td>$2.50</td><td>$7.50</td><td>$0.50</td><td>/messages</td></tr>
+    <tr><td>Qwen3.7 Plus</td><td><code>qwen3.7-plus</code></td><td>$0.40</td><td>$1.60</td><td>$0.04</td><td>/messages</td></tr>
+    <tr><td>Qwen3.6 Plus</td><td><code>qwen3.6-plus</code></td><td>$0.50</td><td>$3.00</td><td>$0.05</td><td>/messages</td></tr>
+    <tr><td>Qwen3.5 Plus</td><td><code>qwen3.5-plus</code></td><td>$0.20</td><td>$1.20</td><td>$0.02</td><td>/messages</td></tr>
+    <tr><td>Kimi K3</td><td><code>kimi-k3</code></td><td>$3.00</td><td>$15.00</td><td>$0.30</td><td>/chat/completions</td></tr>
+    <tr><td>Kimi K2.7 Code</td><td><code>kimi-k2.7-code</code></td><td>$0.95</td><td>$4.00</td><td>$0.19</td><td>/chat/completions</td></tr>
+    <tr><td>Kimi K2.6</td><td><code>kimi-k2.6</code></td><td>$0.95</td><td>$4.00</td><td>$0.16</td><td>/chat/completions</td></tr>
+    <tr><td>Kimi K2.5</td><td><code>kimi-k2.5</code></td><td>$0.60</td><td>$3.00</td><td>$0.10</td><td>/chat/completions</td></tr>
+    <tr><td>GLM 5.2</td><td><code>glm-5.2</code></td><td>$1.40</td><td>$4.40</td><td>$0.26</td><td>/chat/completions</td></tr>
+    <tr><td>GLM 5.1</td><td><code>glm-5.1</code></td><td>$1.40</td><td>$4.40</td><td>$0.26</td><td>/chat/completions</td></tr>
+    <tr><td>GLM 5</td><td><code>glm-5</code></td><td>$1.00</td><td>$3.20</td><td>$0.20</td><td>/chat/completions</td></tr>
+    <tr><td>MiniMax M3</td><td><code>minimax-m3</code></td><td>$0.30</td><td>$1.20</td><td>$0.06</td><td>/chat/completions</td></tr>
+    <tr><td>MiniMax M2.7</td><td><code>minimax-m2.7</code></td><td>$0.30</td><td>$1.20</td><td>$0.06</td><td>/chat/completions</td></tr>
+    <tr><td>MiniMax M2.5</td><td><code>minimax-m2.5</code></td><td>$0.30</td><td>$1.20</td><td>$0.06</td><td>/chat/completions</td></tr>
+  </tbody>
+</table>
+
+<h3>已弃用模型(仍可调用但不推荐)</h3>
+<table>
+  <thead>
+    <tr><th>模型</th><th>弃用日期</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>GPT 5.2 Codex / 5.1 Codex / 5.1 Codex Max / 5.1 Codex Mini / 5 Codex</td><td>2026-07-23</td></tr>
+    <tr><td>Claude Opus 4.1</td><td>2026-08-05</td></tr>
+    <tr><td>MiniMax M2.5</td><td>2026-08-05</td></tr>
+    <tr><td>Kimi K2.5</td><td>2026-08-05</td></tr>
+    <tr><td>Claude Sonnet 4</td><td>2026-06-15</td></tr>
+    <tr><td>GLM 5</td><td>2026-05-14</td></tr>
+    <tr><td>Claude Haiku 3.5</td><td>2026-02-16</td></tr>
+    <tr><td>Gemini 3 Pro</td><td>2026-03-09</td></tr>
+    <tr><td>MiniMax M2.1</td><td>2026-03-15</td></tr>
+    <tr><td>GLM 4.7 / 4.6</td><td>2026-03-15</td></tr>
+    <tr><td>Kimi K2 Thinking / K2</td><td>2026-03-06</td></tr>
+    <tr><td>Qwen3 Coder 480B</td><td>2026-02-06</td></tr>
+  </tbody>
+</table>
+
+<!-- 总结 -->
+<h2>总结与建议</h2>
+<div class="alert alert-warning">
+  <b>核心结论:</b>
+  <ul style="margin: 8px 0 0 20px;">
+    <li><b>上游 opencode.ai 共支持 61 个模型</b>(7 免费 + 54 付费),涵盖 GPT/Claude/Gemini/Grok/DeepSeek/Qwen/Kimi/GLM/MiniMax 等。</li>
+    <li><b>项目代码白名单列出 7 个免费模型</b>,但实际<b>只有 1 个</b>(<code>deepseek-v4-flash-free</code>)能真正使用,其余 6 个仅在 <code>/v1/models</code> 接口中展示。</li>
+    <li>原因是 <code>gateway.js</code> 第 222 行 <code>body.model = FIXED_MODEL</code> 强制覆盖了客户端传入的任何模型名。</li>
+    <li>54 个付费模型完全不在项目白名单中,且 opencode.ai 的免费代理(Authorization: public)大概率无法调用付费模型。</li>
+  </ul>
+</div>
+
+<div class="alert alert-info">
+  <b>如需支持更多模型,可修改 <code>gateway.js</code>:</b>
+  <ul style="margin: 8px 0 0 20px;">
+    <li>删除第 222 行的 <code>body.model = FIXED_MODEL</code> 强制覆盖,让客户端传入的模型名透传到上游。</li>
+    <li>将 <code>FREE_MODELS</code> 数组扩展为完整的模型列表(或动态从 <code>https://opencode.ai/zen/v1/models</code> 拉取)。</li>
+    <li>注意:代码第 26 行已定义 <code>OPENCODE_MODELS</code> 常量但未使用,可据此实现动态拉取。</li>
+    <li>注意端点差异:GPT 走 <code>/responses</code>,Claude/Qwen 走 <code>/messages</code>,Gemini 走 <code>/models/*</code>,其余走 <code>/chat/completions</code>。当前 gateway 仅转发到 <code>/chat/completions</code>。</li>
+  </ul>
+</div>
+
+<div class="footnote">
+  数据来源:项目源码 <code>desktop-app/gateway.js</code> + OpenCode 官方文档 <a href="https://opencode.ai/docs/zen">opencode.ai/docs/zen</a>(2026-08-02 抓取)
+</div>
+
+</body>
+</html>
