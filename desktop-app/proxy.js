@@ -1,22 +1,25 @@
 /**
- * proxy.js - ProxyAgent(核心)
+ * proxy.js - ProxyAgent / PoolAgent(核心)
  *
- * 支持三种出站方式,统一对 gateway 暴露为 https.Agent:
- *   - none  : 直连目标(opencode.ai:443),本地 DNS
- *   - http  : HTTP CONNECT 隧道(可选 Basic 认证)
- *   - socks5: SOCKS5 隧道(RFC 1928 + 用户名密码认证 RFC 1929)
+ * 支持多种出站方式,统一对 gateway 暴露为 https.Agent:
+ *   - none     : 直连目标(opencode.ai:443),本地 DNS
+ *   - http     : 单个 HTTP CONNECT 隧道(可选 Basic 认证)
+ *   - socks5   : 单个 SOCKS5 隧道(RFC 1928 + 用户名密码认证 RFC 1929)
+ *   - http_pool/ socks5_pool: 代理池,每次请求随机抽取一个代理建隧道
  *
  * 实现方式:继承 https.Agent,只重写 createConnection(options, cb)。
  * 先建立到「目标或代理」的 TCP 连接,完成 CONNECT/SOCKS5 握手后,
  * 用 tls.connect({socket: raw, ...}) 在同一 socket 上套 TLS。
  * 域名由代理远端 DNS 解析(规避本地 DNS 污染),SNI 仍是目标域名。
  *
- * 零新增依赖:net / tls / crypto 均为 Node 内置。
+ * 代理池轮换:PoolAgent 关闭 keep-alive,每次请求新建连接 -> 重新随机选代理,
+ * 把请求均匀分发到池内所有代理,规避单代理限流/封禁。
+ *
+ * 零新增依赖:net / tls 均为 Node 内置。
  */
 
 const net = require('net');
 const tls = require('tls');
-const crypto = require('crypto');
 const https = require('https');
 
 const HANDSHAKE_TIMEOUT = 15000;   // 握手/连接超时
@@ -106,6 +109,130 @@ function parseIPv6(host) {
   return out;
 }
 
+// ---- 隧道握手核心(单代理 / 代理池共用)----
+
+/** 底层 socket 就绪(隧道已建立),套上 TLS 后交给 https */
+function handoffToTls(raw, targetHost, options, cb) {
+  raw.setTimeout(0); // 清掉握手超时,勿杀长连接
+  try {
+    const tlsSocket = tls.connect({
+      socket: raw,
+      servername: targetHost,
+      rejectUnauthorized: options.rejectUnauthorized !== false,
+    });
+    tlsSocket.once('error', cb);
+    cb(null, tlsSocket);
+  } catch (e) {
+    cb(e);
+  }
+}
+
+/** HTTP CONNECT 隧道(RFC 7231) */
+function httpConnect(raw, host, port, p, options, cb) {
+  const reqHead = [
+    `CONNECT ${host}:${port} HTTP/1.1`,
+    `Host: ${host}:${port}`,
+    'Proxy-Connection: Keep-Alive',
+  ];
+  if (p.username) {
+    reqHead.push(`Proxy-Authorization: ${basicAuth(p.username, p.password)}`);
+  }
+  reqHead.push('', '');
+
+  let statusLine = '';
+  let headerBuf = Buffer.alloc(0);
+  const onData = (chunk) => {
+    headerBuf = Buffer.concat([headerBuf, chunk]);
+    const idx = headerBuf.indexOf(CRLF + CRLF);
+    if (idx === -1) return;
+    raw.removeListener('data', onData);
+    statusLine = headerBuf.subarray(0, headerBuf.indexOf(CRLF)).toString('utf8');
+    const body = headerBuf.subarray(idx + 4);
+    if (/^\s*HTTP\/1\.[01] 200/i.test(statusLine)) {
+      if (body.length) raw.unshift(body); // 残余字节还给 TLS
+      handoffToTls(raw, host, options, cb);
+    } else {
+      const code = statusLine.split(' ')[1];
+      if (code === '407') {
+        raw.destroy(new Error('代理要求认证(407),请检查用户名密码'));
+      } else {
+        raw.destroy(new Error('代理 CONNECT 失败: ' + statusLine));
+      }
+    }
+  };
+  raw.on('data', onData);
+  raw.write(reqHead.join(CRLF));
+}
+
+/** SOCKS5 隧道(RFC 1928 + 1929) */
+function socks5(raw, host, port, p, options, cb) {
+  const doConnect = () => {
+    const addr = encodeSocksAddr(host);
+    const portBuf = Buffer.from([(port >> 8) & 0xff, port & 0xff]);
+    raw.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00]), addr, portBuf]));
+
+    readN(raw, 4, (err, rep) => {
+      if (err) return cb(err);
+      if (rep[1] !== 0x00) {
+        const reason = {
+          1: '通用失败', 2: '规则不允许', 3: '网络不可达',
+          4: '主机不可达', 5: '连接被拒', 6: 'TTL 超时',
+          7: '命令不支持', 8: '地址类型不支持',
+        }[rep[1]] || `错误码 ${rep[1]}`;
+        return raw.destroy(new Error(`SOCKS5 连接失败: ${reason}`));
+      }
+      // REP=0 成功,读 BND.ADDR+BND.PORT(隧道后不再关心其内容)
+      const atype = rep[3];
+      const tailLen = atype === 0x01 ? 6 : (atype === 0x04 ? 18 : (atype === 0x03 ? 4 : 0));
+      if (!tailLen) return raw.destroy(new Error('SOCKS5 BND 地址类型未知: 0x' + atype.toString(16)));
+      readN(raw, tailLen, (err2) => {
+        if (err2) return cb(err2);
+        handoffToTls(raw, host, options, cb);
+      });
+    });
+  };
+
+  // 方法协商
+  const methods = p.username ? [0x00, 0x02] : [0x00];
+  raw.write(Buffer.from([0x05, methods.length, ...methods]));
+  readN(raw, 2, (err, resp) => {
+    if (err) return cb(err);
+    if (resp[0] !== 0x05) return raw.destroy(new Error('SOCKS5 版本协商失败'));
+    const method = resp[1];
+    if (method === 0xff) return raw.destroy(new Error('SOCKS5 无可接受的认证方式'));
+
+    if (method === 0x02) {
+      // RFC 1929 用户名/密码子协商
+      const u = Buffer.from(p.username || '', 'utf8');
+      const pw = Buffer.from(p.password || '', 'utf8');
+      if (u.length > 255 || pw.length > 255) return raw.destroy(new Error('SOCKS5 用户名/密码过长'));
+      raw.write(Buffer.concat([
+        Buffer.from([0x01, u.length]), u,
+        Buffer.from([pw.length]), pw,
+      ]));
+      readN(raw, 2, (err2, authResp) => {
+        if (err2) return cb(err2);
+        if (authResp[1] !== 0x00) return raw.destroy(new Error('SOCKS5 用户名密码认证失败'));
+        doConnect();
+      });
+    } else if (method === 0x00) {
+      doConnect();
+    } else {
+      return raw.destroy(new Error('SOCKS5 服务器要求未知认证方式: 0x' + method.toString(16)));
+    }
+  });
+}
+
+/** 已连到代理 socket,按代理类型完成握手 */
+function tunnelConnect(raw, proxy, targetHost, targetPort, options, cb) {
+  const type = proxy && proxy.type;
+  if (type === 'http') httpConnect(raw, targetHost, targetPort, proxy, options, cb);
+  else if (type === 'socks5') socks5(raw, targetHost, targetPort, proxy, options, cb);
+  else raw.destroy(new Error('未知代理类型: ' + type));
+}
+
+// ---- 单个固定代理 ----
+
 class ProxyAgent extends https.Agent {
   /**
    * @param {object} proxy  {type, host, port, username, password}
@@ -133,7 +260,7 @@ class ProxyAgent extends https.Agent {
     if (type === 'none' || !type) {
       const raw = net.connect({ host: targetHost, port: targetPort });
       raw.once('error', cb);
-      raw.once('connect', () => this._handoffToTls(raw, targetHost, options, cb));
+      raw.once('connect', () => handoffToTls(raw, targetHost, options, cb));
       return; // 不返回裸 socket,避免 Node 提前使用未握手的连接
     }
 
@@ -146,127 +273,55 @@ class ProxyAgent extends https.Agent {
     raw.once('timeout', () => {
       raw.destroy(new Error('代理连接超时'));
     });
-    raw.once('connect', () => {
-      if (type === 'http') this._httpConnect(raw, targetHost, targetPort, p, options, cb);
-      else if (type === 'socks5') this._socks5(raw, targetHost, targetPort, p, options, cb);
-      else {
-        raw.destroy(new Error('未知代理类型: ' + type));
-      }
-    });
+    raw.once('connect', () => tunnelConnect(raw, p, targetHost, targetPort, options, cb));
     return; // 不返回裸 socket,Node 只认回调返回的握手完成 socket
-  }
-
-  /** 底层 socket 就绪(隧道已建立),套上 TLS 后交给 https */
-  _handoffToTls(raw, targetHost, options, cb) {
-    raw.setTimeout(0); // 清掉握手超时,勿杀长连接
-    try {
-      const tlsSocket = tls.connect({
-        socket: raw,
-        servername: targetHost,
-        rejectUnauthorized: options.rejectUnauthorized !== false,
-      });
-      tlsSocket.once('error', cb);
-      cb(null, tlsSocket);
-    } catch (e) {
-      cb(e);
-    }
-  }
-
-  /** HTTP CONNECT 隧道(RFC 7231) */
-  _httpConnect(raw, host, port, p, options, cb) {
-    const reqHead = [
-      `CONNECT ${host}:${port} HTTP/1.1`,
-      `Host: ${host}:${port}`,
-      'Proxy-Connection: Keep-Alive',
-    ];
-    if (p.username) {
-      reqHead.push(`Proxy-Authorization: ${basicAuth(p.username, p.password)}`);
-    }
-    reqHead.push('', '');
-
-    let statusLine = '';
-    let headerBuf = Buffer.alloc(0);
-    const onData = (chunk) => {
-      headerBuf = Buffer.concat([headerBuf, chunk]);
-      const idx = headerBuf.indexOf(CRLF + CRLF);
-      if (idx === -1) return;
-      raw.removeListener('data', onData);
-      statusLine = headerBuf.subarray(0, headerBuf.indexOf(CRLF)).toString('utf8');
-      const body = headerBuf.subarray(idx + 4);
-      if (/^\s*HTTP\/1\.[01] 200/i.test(statusLine)) {
-        if (body.length) raw.unshift(body); // 残余字节还给 TLS
-        this._handoffToTls(raw, host, options, cb);
-      } else {
-        const code = statusLine.split(' ')[1];
-        if (code === '407') {
-          raw.destroy(new Error('代理要求认证(407),请检查用户名密码'));
-        } else {
-          raw.destroy(new Error('代理 CONNECT 失败: ' + statusLine));
-        }
-      }
-    };
-    raw.on('data', onData);
-    raw.write(reqHead.join(CRLF));
-  }
-
-  /** SOCKS5 隧道(RFC 1928 + 1929) */
-  _socks5(raw, host, port, p, options, cb) {
-    const doConnect = () => {
-      const addr = encodeSocksAddr(host);
-      const portBuf = Buffer.from([(port >> 8) & 0xff, port & 0xff]);
-      raw.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00]), addr, portBuf]));
-
-      readN(raw, 4, (err, rep) => {
-        if (err) return cb(err);
-        if (rep[1] !== 0x00) {
-          const reason = {
-            1: '通用失败', 2: '规则不允许', 3: '网络不可达',
-            4: '主机不可达', 5: '连接被拒', 6: 'TTL 超时',
-            7: '命令不支持', 8: '地址类型不支持',
-          }[rep[1]] || `错误码 ${rep[1]}`;
-          return raw.destroy(new Error(`SOCKS5 连接失败: ${reason}`));
-        }
-        // REP=0 成功,读 BND.ADDR+BND.PORT(隧道后不再关心其内容)
-        const atype = rep[3];
-        const tailLen = atype === 0x01 ? 6 : (atype === 0x04 ? 18 : (atype === 0x03 ? 1 + 1 + 2 : 0));
-        if (!tailLen) return raw.destroy(new Error('SOCKS5 BND 地址类型未知: 0x' + atype.toString(16)));
-        readN(raw, tailLen, (err2) => {
-          if (err2) return cb(err2);
-          this._handoffToTls(raw, host, options, cb);
-        });
-      });
-    };
-
-    // 方法协商
-    const methods = p.username ? [0x00, 0x02] : [0x00];
-    raw.write(Buffer.from([0x05, methods.length, ...methods]));
-    readN(raw, 2, (err, resp) => {
-      if (err) return cb(err);
-      if (resp[0] !== 0x05) return raw.destroy(new Error('SOCKS5 版本协商失败'));
-      const method = resp[1];
-      if (method === 0xff) return raw.destroy(new Error('SOCKS5 无可接受的认证方式'));
-
-      if (method === 0x02) {
-        // RFC 1929 用户名/密码子协商
-        const u = Buffer.from(p.username || '', 'utf8');
-        const pw = Buffer.from(p.password || '', 'utf8');
-        if (u.length > 255 || pw.length > 255) return raw.destroy(new Error('SOCKS5 用户名/密码过长'));
-        raw.write(Buffer.concat([
-          Buffer.from([0x01, u.length]), u,
-          Buffer.from([pw.length]), pw,
-        ]));
-        readN(raw, 2, (err2, authResp) => {
-          if (err2) return cb(err2);
-          if (authResp[1] !== 0x00) return raw.destroy(new Error('SOCKS5 用户名密码认证失败'));
-          doConnect();
-        });
-      } else if (method === 0x00) {
-        doConnect();
-      } else {
-        return raw.destroy(new Error('SOCKS5 服务器要求未知认证方式: 0x' + method.toString(16)));
-      }
-    });
   }
 }
 
-module.exports = { ProxyAgent };
+// ---- 代理池(随机抽取)----
+
+class PoolAgent extends https.Agent {
+  /**
+   * @param {Array} pool   代理数组 [{type, host, port, username, password}, ...]
+   * @param {object} opts  https.Agent 选项(可覆盖默认)
+   */
+  constructor(pool, opts = {}) {
+    super({
+      // 关闭 keep-alive:每次请求新建连接 -> 重新随机选代理,实现轮换分发
+      keepAlive: false,
+      maxSockets: 32,
+      rejectUnauthorized: false,
+      ...opts,
+    });
+    this.pool = pool || [];
+  }
+
+  /** 每次连接随机抽取一个代理 */
+  pickProxy() {
+    const pool = this.pool;
+    if (!pool.length) return null;
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  createConnection(options, callback) {
+    const cb = cbOnce(callback);
+    const targetHost = options.servername || options.host;
+    const targetPort = options.port || 443;
+    const p = this.pickProxy();
+    if (!p) {
+      cb(new Error('代理池为空,请先导入代理'));
+      return;
+    }
+    const proxyPort = p.port || (p.type === 'socks5' ? 1080 : 3128);
+    const raw = net.connect({ host: p.host, port: proxyPort });
+    raw.setTimeout(HANDSHAKE_TIMEOUT);
+    raw.once('error', cb);
+    raw.once('timeout', () => {
+      raw.destroy(new Error('代理连接超时'));
+    });
+    raw.once('connect', () => tunnelConnect(raw, p, targetHost, targetPort, options, cb));
+    return;
+  }
+}
+
+module.exports = { ProxyAgent, PoolAgent };

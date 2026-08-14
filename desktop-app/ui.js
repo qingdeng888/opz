@@ -61,8 +61,21 @@ input, select {
   font-size: 13px;
   outline: none;
 }
-input:focus, select:focus { border-color: var(--info); }
+input:focus, select:focus, textarea:focus { border-color: var(--info); }
 input::placeholder { color: #4a5368; }
+textarea {
+  width: 100%;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  color: var(--text-main);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+  line-height: 1.6;
+  outline: none;
+  resize: vertical;
+}
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   border: none; border-radius: 8px; padding: 9px 18px;
@@ -189,6 +202,8 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
         <option value="none">直连</option>
         <option value="http">HTTP 代理</option>
         <option value="socks5">SOCKS5 代理</option>
+        <option value="http_pool">HTTP 代理池</option>
+        <option value="socks5_pool">SOCKS5 代理池</option>
       </select>
     </div>
     <div id="proxy-fields" style="display:none;">
@@ -212,6 +227,13 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
           <input id="f-proxy-pass" type="password" placeholder="********">
         </div>
       </div>
+    </div>
+    <div id="pool-fields" style="display:none;">
+      <div class="field full">
+        <label for="f-pool-lines">代理列表(每行一个,保存后自动随机抽取)</label>
+        <textarea id="f-pool-lines" rows="8" placeholder="http://user:password@ip:port&#10;socks5://user:password@ip:port&#10;http://ip:port"></textarea>
+      </div>
+      <div class="sub">每行一个代理,支持 <code>http://</code> 或 <code>socks5://</code> 前缀,可带 <code>user:password@</code>;无效行自动忽略</div>
     </div>
     <div class="msg" id="msg-proxy"></div>
   </div>
@@ -313,6 +335,7 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
       el('f-proxy-port').value = j.proxy.port || '';
       el('f-proxy-user').value = j.proxy.username || '';
       el('f-proxy-pass').value = j.proxy.password ? '********' : '';
+      el('f-pool-lines').value = (j.proxy.pool || []).map(poolLine).join('\\n');
       el('f-adminpass').value = '';
       el('st-port').textContent = j.port;
       state.freeModels = (j.freeModels || []).slice();
@@ -336,11 +359,19 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
   }
 
   // ---- 代理字段显隐 ----
+  function isPoolType(v) { return v === 'http_pool' || v === 'socks5_pool'; }
   function toggleProxyFields() {
-    var on = el('f-proxy-type').value !== 'none';
-    show('proxy-fields', on);
+    var v = el('f-proxy-type').value;
+    show('proxy-fields', v === 'http' || v === 'socks5');
+    show('pool-fields', isPoolType(v));
   }
   el('f-proxy-type').addEventListener('change', toggleProxyFields);
+
+  // 结构化池条目 -> 单行文本(密码回显脱敏 '********')
+  function poolLine(e) {
+    var cred = e.username ? (e.username + (e.password ? ':' + e.password : '') + '@') : '';
+    return e.type + '://' + cred + e.host + ':' + e.port;
+  }
 
   // ---- 免费模型编辑(本地暂存,保存时一并提交)----
   function renderModels() {
@@ -394,7 +425,8 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
       host: el('f-proxy-host').value.trim(),
       port: parseInt(el('f-proxy-port').value) || 0,
       username: el('f-proxy-user').value,
-      password: el('f-proxy-pass').value
+      password: el('f-proxy-pass').value,
+      pool: el('f-pool-lines').value.split('\\n').map(function (s) { return s.trim(); }).filter(Boolean)
     };
     var payload = {
       apiKey: el('f-apikey').value.trim(),

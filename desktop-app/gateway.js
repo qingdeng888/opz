@@ -20,7 +20,7 @@ const { URL } = require('url');
 const crypto = require('crypto');
 const fs = require('fs');
 const config = require('./config');
-const { ProxyAgent } = require('./proxy');
+const { ProxyAgent, PoolAgent } = require('./proxy');
 const UI_HTML = require('./ui');
 
 const OPENCODE_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completions';
@@ -137,15 +137,21 @@ class Gateway {
     this.agentSig = '';         // 记录构建 agent 时的代理签名
   }
 
-  // ---- 出站 agent(直连 / ProxyAgent)----
+  // ---- 出站 agent(直连 / ProxyAgent / PoolAgent)----
   proxyLabel() {
     const p = this.config.proxy;
     if (!p || p.type === 'none') return '直连';
+    // 代理池:显示模式与池内代理数量
+    if (p.type === 'http_pool' || p.type === 'socks5_pool') {
+      const n = (p.pool || []).length;
+      return `${p.type}(${n})`;
+    }
     const auth = p.username ? `${p.username}:***@` : '';
     return `${p.type}://${auth}${p.host}:${p.port}`;
   }
   proxySig(p) {
-    return `${p.type}|${p.host}|${p.port}|${p.username}|${p.password}`;
+    const pool = (p.pool || []).map(e => `${e.type}|${e.host}|${e.port}|${e.username}|${e.password}`).join(';');
+    return `${p.type}|${p.host}|${p.port}|${p.username}|${p.password}|${pool}`;
   }
   destroyAgent() {
     if (this.agent) { try { this.agent.destroy(); } catch {} this.agent = null; }
@@ -155,10 +161,15 @@ class Gateway {
     const sig = this.proxySig(p);
     if (!this.agent || this.agentSig !== sig) {
       this.destroyAgent();
-      const base = { keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false };
-      this.agent = (p.type === 'none' || !p.type)
-        ? new https.Agent(base)
-        : new ProxyAgent(p, base);
+      const type = p.type;
+      if (type === 'none' || !type) {
+        this.agent = new https.Agent({ keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false });
+      } else if (type === 'http_pool' || type === 'socks5_pool') {
+        // 代理池:每次请求随机抽取一个代理;keepAlive 关闭由 PoolAgent 内部保证
+        this.agent = new PoolAgent(p.pool || [], { maxSockets: 32, rejectUnauthorized: false });
+      } else {
+        this.agent = new ProxyAgent(p, { keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false });
+      }
       this.agentSig = sig;
     }
     return this.agent;
@@ -342,7 +353,21 @@ class Gateway {
       port: pc.port !== undefined ? pc.port : next.proxy.port,
       username: pc.username !== undefined ? pc.username : next.proxy.username,
       password: (pc.password && pc.password !== '********') ? pc.password : next.proxy.password,
+      pool: pc.pool !== undefined ? pc.pool : next.proxy.pool,
     });
+
+    // 代理池密码哨兵:'********' 保持旧池中同 key 条目的原密码
+    // (前端重载配置后看到的是脱敏密码,直接保存需靠 key 匹配还原)
+    if (Array.isArray(next.proxy.pool)) {
+      const oldPool = config.normalizeProxyPool(this.config.proxy.pool);
+      next.proxy.pool = next.proxy.pool.map(e => {
+        if (e.password === '********') {
+          const old = oldPool.find(o => o.type === e.type && o.host === e.host && o.port === e.port && o.username === e.username);
+          if (old) return { ...e, password: old.password };
+        }
+        return e;
+      });
+    }
 
     // 免费模型白名单:数组则归一化存储(空数组=回退内置默认);其余忽略
     if (Array.isArray(body.freeModels)) {
