@@ -38,7 +38,8 @@ docker compose up -d --build
 docker compose logs -f  # 查看 API Key 等连接信息
 ```
 
-- 数据持久化在 Docker 卷 `zen-data`(`config.json` / `usage.json` / `info.txt`)
+- 数据持久化在 Docker 卷 `zen-data`(`config.json` / `usage.json` / `info.txt`),克隆后直接 `up` 即可运行,无需手动 chown
+- 查看/迁移配置:`docker compose exec zen-gateway cat /data/config.json`;导出到宿主机:`` docker run --rm -v zen-data:/data -v $(pwd)/backup:/backup alpine sh -c 'cp -a /data/. /backup/' ``
 - 改端口只需改 `.env` 的 `ZEN_PORT`,端口映射自动同步
 - 健康检查自动探测 `/health`;停止:`docker compose down`
 - 也可直接用 `docker run`:`docker run -d -p 9527:9527 -v zen-data:/data -e ZEN_ADMIN_PASSWORD=xxx zen-gateway`

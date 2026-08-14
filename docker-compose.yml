@@ -26,8 +26,9 @@ services:
 
     volumes:
       # 配置与用量统计持久化(config.json / usage.json / info.txt)
-      # bind mount 到项目 .zen-data,便于直接查看/修改配置,也便于从裸机迁移
-      - ./.zen-data:/data
+      # 使用命名卷:首次挂载时 Docker 自动继承镜像内 /data 的属主(node,uid 1000),
+      # 克隆后直接 up 即可运行,无需手动 chown。查看配置:docker compose exec zen-gateway cat /data/config.json
+      - zen-data:/data
 
     # 健康检查:GET /health 成功即存活(Node 20 内置 fetch)
     healthcheck:
@@ -36,3 +37,11 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+# 命名卷声明(数据持久化于 docker volume zen-data,可跨部署复用)
+# name 固定为裸名 zen-data,与 README 中 `docker run -v zen-data:/data` 及数据迁移命令一致,
+# 不受 compose project 名(opz)前缀影响
+volumes:
+  zen-data:
+    name: zen-data
+
