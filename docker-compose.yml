@@ -1,0 +1,38 @@
+# Zen Free Gateway - Docker Compose 部署
+#
+# 用法:
+#   1. cp .env.example .env         # 按需修改(尤其 ZEN_ADMIN_PASSWORD)
+#   2. docker compose up -d --build
+#   3. docker compose logs -f       # 查看启动横幅(API Key / 面板地址)
+#
+services:
+  zen-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: zen-gateway:latest
+    container_name: zen-gateway
+    restart: unless-stopped
+
+    # 配置经 .env 传入(端口 / 管理密码 / 代理等)
+    env_file:
+      - .env
+    environment:
+      # 数据目录固定挂卷;compose 显式指定,优先级高于 env_file 中的同名项
+      ZEN_DATA_DIR: /data
+
+    ports:
+      - "${ZEN_PORT:-9527}:${ZEN_PORT:-9527}"
+
+    volumes:
+      # 配置与用量统计持久化(config.json / usage.json / info.txt)
+      # bind mount 到项目 .zen-data,便于直接查看/修改配置,也便于从裸机迁移
+      - ./.zen-data:/data
+
+    # 健康检查:GET /health 成功即存活(Node 20 内置 fetch)
+    healthcheck:
+      test: ["CMD", "node", "-e", "const p=process.env.ZEN_PORT||9527;fetch('http://127.0.0.1:'+p+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

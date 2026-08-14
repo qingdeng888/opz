@@ -2,20 +2,19 @@
 /**
  * cli.js - Zen Free Gateway 命令行入口(无头/Linux 部署)
  *
- * 替代 Electron 的 main.js:不创建窗口,直接在终端运行。
- * 复用 gateway.js / mihomo.js / config.js,核心逻辑与桌面版一致。
- *
  * 用法:
- *   node cli.js                 # 启动网关 + mihomo
- *   ZEN_DATA_DIR=/path node cli.js   # 自定义数据目录
- *   node cli.js --print-config  # 打印当前配置(隐藏订阅 URL)
- *   node cli.js --reset         # 手动重置(清冷却 + 重拉订阅 + 重启 mihomo)
+ *   node cli.js                        # 启动网关
+ *   ZEN_DATA_DIR=/path node cli.js     # 自定义数据目录
+ *   ZEN_PROXY=http:127.0.0.1:7890 node cli.js   # 环境变量指定代理
+ *   node cli.js --print-config         # 打印当前配置(敏感项脱敏)
+ *   node cli.js --reload               # 重新加载配置(打印脱敏摘要)
+ *
+ * 首次启动自动生成 API Key 与管理面板密码,写入配置并打印。
  */
 
 const path = require('path');
 const fs = require('fs');
 const { Gateway, FIXED_MODEL } = require('./gateway');
-const mihomo = require('./mihomo');
 const config = require('./config');
 
 let gateway = null;
@@ -39,9 +38,7 @@ function getLocalIP() {
   return '127.0.0.1';
 }
 
-// 定位"程序目录":
-//   - 编译后的单文件二进制:进程可执行文件所在目录(process.execPath)
-//   - 源码(node)运行:本脚本所在目录(__dirname)
+// 定位"程序目录":编译后的单文件二进制用可执行文件所在目录,源码用 __dirname
 function getProgramDir() {
   try {
     const exeBase = path.basename(process.execPath);
@@ -52,19 +49,73 @@ function getProgramDir() {
   return __dirname;
 }
 
-async function ensureMihomo(cfg) {
-  const running = await mihomo.isRunning();
-  if (!running) {
-    log('info', '[mihomo] 未运行,启动中...');
-    await mihomo.start(cfg.mihomoExe, log);
-  } else {
-    log('ok', '[mihomo] 已在运行');
+// 解析 ZEN_PROXY 环境变量:http:host:port / socks5:host:port / 可带 user:pass@
+function parseProxyEnv(s) {
+  const m = String(s || '').match(/^(http|socks5):(.+)$/);
+  if (!m) return null;
+  const type = m[1];
+  let rest = m[2];
+  let username = '', password = '';
+  const at = rest.lastIndexOf('@');
+  if (at >= 0) {
+    const cred = rest.slice(0, at);
+    const ai = cred.indexOf(':');
+    if (ai >= 0) { username = cred.slice(0, ai); password = cred.slice(ai + 1); }
+    else { username = cred; }
+    rest = rest.slice(at + 1);
   }
+  let host = rest, port = 0;
+  const m2 = host.match(/^(.*):(\d+)$/);
+  if (m2) { host = m2[1]; port = parseInt(m2[2], 10); }
+  return config.normalizeProxy({ type, host, port, username, password });
+}
+
+// 首启初始化:API Key / 管理密码 / 环境变量覆盖
+function applyEnvAndInit(cfg) {
+  let changed = false;
+
+  if (process.env.ZEN_HOST) { cfg.host = process.env.ZEN_HOST; changed = true; }
+  if (process.env.ZEN_PORT) { cfg.port = parseInt(process.env.ZEN_PORT, 10); changed = true; }
+  if (process.env.ZEN_ADMIN_PASSWORD) { cfg.adminPassword = process.env.ZEN_ADMIN_PASSWORD; changed = true; }
+  if (process.env.ZEN_PROXY) {
+    const p = parseProxyEnv(process.env.ZEN_PROXY);
+    if (p) {
+      cfg.proxy = p;
+      changed = true;
+      log('info', `[init] 使用环境变量代理: ${p.type}://${p.username ? p.username + '@' : ''}${p.host}:${p.port || '(默认)'}`);
+    } else {
+      log('warn', '[init] ZEN_PROXY 格式无效,应为 http:host:port / socks5:host:port(可带 user:pass@)');
+    }
+  }
+
+  // ZEN_FREE_MODELS:逗号分隔的免费模型白名单,覆盖内置默认(仅供首启/初始部署)
+  if (process.env.ZEN_FREE_MODELS) {
+    const fm = config.normalizeFreeModels(process.env.ZEN_FREE_MODELS.split(','));
+    if (fm.length) {
+      cfg.freeModels = fm;
+      changed = true;
+      log('info', `[init] 免费模型白名单(env): ${fm.join(', ')}`);
+    }
+  }
+
+  if (!cfg.apiKey) {
+    cfg.apiKey = config.genApiKey();
+    changed = true;
+    log('info', `[init] 生成 API Key: ${cfg.apiKey}`);
+  }
+  if (!cfg.adminPassword) {
+    config.ensureAdminPassword(cfg);
+    changed = true;
+    log('info', `[init] 生成管理面板密码: ${cfg.adminPassword}`);
+  }
+
+  if (changed) config.save(cfg);
+  return cfg;
 }
 
 async function startGateway(cfg) {
   if (gateway) { await gateway.stop(); gateway = null; }
-  gateway = new Gateway({ apiKey: cfg.apiKey, port: cfg.port, host: cfg.host || '0.0.0.0', USAGE_FILE: config.USAGE_FILE }, log);
+  gateway = new Gateway(cfg, log);
   const port = await gateway.start();
   if (port !== cfg.port) {
     cfg.port = port;
@@ -75,130 +126,72 @@ async function startGateway(cfg) {
 }
 
 async function bootstrap() {
-  let cfg = config.load();
-  // 环境变量覆盖(便于无头部署):
-  if (process.env.ZEN_HOST) cfg.host = process.env.ZEN_HOST;
-  if (process.env.ZEN_PORT) cfg.port = parseInt(process.env.ZEN_PORT, 10);
-  if (!cfg.apiKey) {
-    cfg.apiKey = config.genApiKey();
-    config.save(cfg);
-    log('info', `[init] 生成 API Key: ${cfg.apiKey}`);
-  }
-
-  try { fs.mkdirSync(config.MIHOMO_DATA_DIR, { recursive: true }); } catch {}
-
-  if (cfg.subscriptionUrl) {
-    try {
-      log('info', '[sub] 刷新订阅...');
-      const r = await config.refreshMihomoConfig(cfg.subscriptionUrl);
-      log('ok', `[sub] 已刷新,${r.nodeCount} 个节点`);
-    } catch (e) {
-      log('error', '[sub] 刷新失败: ' + e.message);
-    }
-  } else if (!fs.existsSync(config.MIHOMO_CONFIG)) {
-    const bundled = path.join(config.getBundledMihomoDir(), 'mihomo-zen.yaml');
-    try {
-      if (fs.existsSync(bundled)) {
-        fs.copyFileSync(bundled, config.MIHOMO_CONFIG);
-        log('ok', '[sub] 使用内置 mihomo 配置');
-      } else {
-        log('warn', '[sub] 未配置订阅 URL,且无内置配置,mihomo 不会启动');
-      }
-    } catch (e) {
-      log('error', '[sub] 写入内置配置失败: ' + e.message);
-    }
-  }
-
-  try {
-    await ensureMihomo(cfg);
-  } catch (e) {
-    log('error', '[mihomo] 启动失败: ' + e.message);
-  }
+  let cfg = applyEnvAndInit(config.load());
 
   const port = await startGateway(cfg);
   const host = cfg.host || '0.0.0.0';
   const displayHost = host === '0.0.0.0' ? getLocalIP() : host;
-  log('ok', `[gateway] 已启动: http://${displayHost}:${port}`);
-  log('ok', `[gateway] URL: http://${displayHost}:${port}/v1`);
-  log('ok', `[gateway] Key: ${cfg.apiKey}`);
-  log('ok', `[gateway] Model: ${FIXED_MODEL} (固定)`);
+  const panelUrl = `http://${displayHost}:${port}`;
+
+  console.log('┌──────────────────────────────────────────────┐');
+  console.log('│          Zen Free Gateway 已启动              │');
+  console.log('├──────────────────────────────────────────────┤');
+  console.log(`│ 管理面板: ${panelUrl.padEnd(28)}│`);
+  console.log(`│ 面板密码: ${String(cfg.adminPassword).padEnd(28)}│`);
+  console.log(`│ API 端点: ${(panelUrl + '/v1').padEnd(28)}│`);
+  console.log(`│ API Key:  ${String(cfg.apiKey).padEnd(28)}│`);
+  console.log(`│ 模型:     ${FIXED_MODEL.padEnd(28)}│`);
+  console.log(`│ 出站:     ${String(gateway.proxyLabel()).padEnd(28)}│`);
+  console.log('└──────────────────────────────────────────────┘');
   log('info', `[gateway] 配置目录: ${config.CONFIG_FILE}`);
-  // 写入连接信息文件,方便 systemd 后台运行后查看。
-  // 优先放程序目录(二进制所在目录),不可写时依次回退:当前目录 -> 数据目录。
+
+  // 写入连接信息文件(含面板密码,注意保护该文件)
+  // 候选为「目录」,信息文件固定名为 info.txt
   const infoCandidates = [
-    path.join(getProgramDir(), 'info.txt'),
-    path.join(process.cwd(), 'info.txt'),
-    path.join(path.dirname(config.CONFIG_FILE), 'info.txt'),
+    getProgramDir(),
+    process.cwd(),
+    path.dirname(config.CONFIG_FILE),
   ];
-  let infoFile = null;
-  try {
-    const info = [
-      'Zen Free Gateway 连接信息',
-      '=========================',
-      `端口:      ${port}`,
-      `监听:      ${host}`,
-      `Base URL:  http://${displayHost}:${port}/v1`,
-      `API Key:   ${cfg.apiKey}`,
-      `Model:     ${FIXED_MODEL}`,
-      `数据目录:  ${config.CONFIG_FILE}`,
-      `生成时间:  ${new Date().toISOString()}`,
-      '',
-    ].join('\n');
-    for (const cand of infoCandidates) {
-      try {
-        fs.writeFileSync(cand, info, 'utf8');
-        infoFile = cand;
-        break;
-      } catch {}
-    }
-    if (infoFile) {
-      log('ok', `[gateway] 连接信息已写入: ${infoFile}`);
-    } else {
-      log('warn', '[gateway] 无法写入 info.txt(所有位置均失败)');
-    }
-  } catch (e) {
-    log('warn', '[gateway] 写 info.txt 失败: ' + e.message);
+  const info = [
+    'Zen Free Gateway 连接信息(敏感,请勿泄露)',
+    '=========================',
+    `管理面板:  ${panelUrl}`,
+    `面板密码:  ${cfg.adminPassword}`,
+    `Base URL:  ${panelUrl}/v1`,
+    `API Key:   ${cfg.apiKey}`,
+    `Model:     ${FIXED_MODEL}`,
+    `数据目录:  ${config.CONFIG_FILE}`,
+    `生成时间:  ${new Date().toISOString()}`,
+    '',
+  ].join('\n');
+  for (const cand of infoCandidates) {
+    try {
+      fs.mkdirSync(cand, { recursive: true });
+      fs.writeFileSync(path.join(cand, 'info.txt'), info, 'utf8');
+      log('ok', `[gateway] 连接信息已写入: ${path.join(cand, 'info.txt')}`);
+      break;
+    } catch {}
   }
+
   log('info', '[ctrl] Ctrl+C 停止');
 }
-
-async function manualReset() {
-  log('warn', '===== 手动重置开始 =====');
-  const cfg = config.load();
-  if (gateway) { gateway.pause(); log('info', '[reset] gateway 已暂停'); }
-  if (gateway) { const n = gateway.resetCooldowns(); log('ok', `[reset] 清空 ${n} 个冷却记录`); }
-  if (cfg.subscriptionUrl) {
-    try {
-      const r = await config.refreshMihomoConfig(cfg.subscriptionUrl);
-      log('ok', `[reset] 订阅刷新,${r.nodeCount} 个节点`);
-    } catch (e) { log('error', '[reset] 订阅刷新失败: ' + e.message); }
-  }
-  try {
-    await mihomo.stop(log);
-    await sleep(800);
-    await ensureMihomo(cfg);
-  } catch (e) { log('error', '[reset] mihomo 重启失败: ' + e.message); }
-  try {
-    if (fs.existsSync(config.LAST_NODE_FILE)) fs.unlinkSync(config.LAST_NODE_FILE);
-    log('ok', '[reset] 已清除上次节点记录');
-  } catch {}
-  if (gateway) { gateway.resume(); log('ok', '[reset] gateway 已恢复'); }
-  log('ok', '===== 手动重置完成 =====');
-}
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function main() {
   const arg = process.argv[2];
   if (arg === '--print-config') {
     const cfg = config.load();
-    console.log(JSON.stringify({ ...cfg, subscriptionUrl: cfg.subscriptionUrl ? '***' : '' }, null, 2));
+    console.log(JSON.stringify(config.sanitize(cfg), null, 2));
     return;
   }
-  if (arg === '--reset') { await manualReset(); return; }
+  if (arg === '--reload') {
+    const cfg = config.load();
+    console.log('== 当前配置(脱敏)==');
+    console.log(JSON.stringify(config.sanitize(cfg), null, 2));
+    return;
+  }
   if (arg && arg.startsWith('-')) {
     console.error('未知参数: ' + arg);
-    console.error('用法: node cli.js [--print-config|--reset]');
+    console.error('用法: node cli.js [--print-config|--reload]');
     process.exit(1);
   }
 
@@ -210,7 +203,6 @@ async function main() {
     stopping = true;
     log('info', `[ctrl] 收到 ${sig},正在停止...`);
     if (gateway) { try { await gateway.stop(); } catch {} }
-    await mihomo.stop(log);
     log('ok', '[ctrl] 已停止,再见');
     process.exit(0);
   };

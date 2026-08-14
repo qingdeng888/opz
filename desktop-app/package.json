@@ -1,16 +1,14 @@
 {
   "name": "zen-free-gateway",
   "version": "1.0.0",
-  "description": "OpenAI 兼容的本地 API 网关,带 IP 轮换自动重置额度(Debian 13 CLI 版)",
+  "description": "OpenAI 兼容的本地 API 网关,支持直连/HTTP/SOCKS5 代理转发到 opencode.ai,内嵌 Web 管理面板",
   "main": "cli.js",
   "scripts": {
     "start": "node cli.js",
-    "reset": "node cli.js --reset",
+    "reload": "node cli.js --reload",
     "config": "node cli.js --print-config"
   },
   "author": "",
   "license": "MIT",
-  "dependencies": {
-    "js-yaml": "^4.1.0"
-  }
+  "dependencies": {}
 }

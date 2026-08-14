@@ -1,0 +1,16 @@
+# 敏感配置(含管理密码/API Key/代理密码,勿提交)
+.env
+
+# 运行时数据(配置与用量统计持久化)
+.zen-data/
+
+# 本地运行产物
+desktop-app/dist/
+desktop-app/node_modules/
+desktop-app/package-lock.json
+desktop-app/info.txt
+desktop-app/.zen-data/
+
+# 系统文件
+.desktop.ini
+.DS_Store

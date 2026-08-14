@@ -1,0 +1,18 @@
+# 构建上下文排除项(敏感文件与无关产物不入镜像)
+.git
+.gitignore
+*.html
+Dockerfile
+docker-compose.yml
+.env
+.env.example
+.desktop.ini
+
+# 本地运行产物
+desktop-app/dist
+desktop-app/node_modules
+desktop-app/package-lock.json
+desktop-app/.zen-data
+desktop-app/info.txt
+# docker bind mount 数据目录(不入镜像)
+.zen-data

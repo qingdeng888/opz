@@ -10,7 +10,8 @@ export default {
         "Host": "opencode.ai",
         "Accept": "*/*",
         "Accept-Encoding": "gzip, br",
-        "User-Agent": "node"
+        "User-Agent": "opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+        "X-Opencode-Client": "cli"
       };
 
       let body = null;

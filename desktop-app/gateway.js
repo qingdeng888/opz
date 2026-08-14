@@ -1,35 +1,42 @@
 /**
- * gateway.js - 本地 OpenAI 兼容 API 网关
+ * gateway.js - 本地 OpenAI 兼容 API 网关(无 mihomo,支持直连/HTTP/SOCKS5 代理)
  *
- * 对外暴露标准 OpenAI 协议:
- *   POST /v1/chat/completions
- *   GET  /v1/models
+ * 对外暴露:
+ *   GET  /health                健康检查(免鉴权)
+ *   GET  /                      管理面板 HTML(免鉴权)
+ *   POST /api/login             面板登录(免鉴权) -> token
+ *   GET|PUT /api/config         查看/修改配置(token 鉴权)
+ *   POST /api/test              测试上游连通(token 鉴权)
+ *   GET  /v1/models             模型列表(API Key 鉴权)
+ *   POST /v1/chat/completions   聊天补全,SSE 流式(API Key 鉴权)
  *
- * 内部逻辑:
- *   1. 收到请求 -> 校验 API Key
- *   2. 通过本地 mihomo 代理(17897)转发到 opencode.ai/zen/v1/chat/completions
- *   3. 遇到 429 -> 切换 mihomo 调度节点的选择 -> 重试
- *   4. 成功后记住该节点,下次优先用
- *
- * 模型固定:deepseek-v4-flash-free(忽略客户端传的 model,强制覆盖)
+ * 出站方式由 config.proxy.type 决定:none=直连,http=HTTP CONNECT, socks5=SOCKS5。
+ * 代理配置可热更新(setProxy/applyConfig),无需重启。
  */
 
 const http = require('http');
 const https = require('https');
 const { URL } = require('url');
+const crypto = require('crypto');
 const fs = require('fs');
-const path = require('path');
-const yaml = require('js-yaml');
 const config = require('./config');
+const { ProxyAgent } = require('./proxy');
+const UI_HTML = require('./ui');
 
 const OPENCODE_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completions';
 const OPENCODE_MODELS = 'https://opencode.ai/zen/v1/models';
 const FIXED_MODEL = 'deepseek-v4-flash-free';
-const MIHOMO_PROXY_PORT = 17897;
-const MIHOMO_CTRL_PORT = 19090;
-const POOL_NAME = 'zen-pool';
 
+// opencode.ai 官方客户端请求头
+// 实测:带上这两个头可被服务端识别为 opencode CLI 客户端,显著降低免费额度限流(429 FreeUsageLimitError)概率
+const OPENCODE_HEADERS = {
+  'User-Agent': 'opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13',
+  'X-Opencode-Client': 'cli',
+};
+
+// 免费模型默认白名单(config.freeModels 为空时兜底)
 // 免费模型白名单(供 /v1/models 返回)
+// 用户可在管理面板增删(存 config.freeModels,热加载生效),这里保留一份出厂默认
 const FREE_MODELS = [
   'deepseek-v4-flash-free',
   'big-pickle',
@@ -38,58 +45,18 @@ const FREE_MODELS = [
   'ling-3.0-flash-free',
   'north-mini-code-free',
   'nemotron-3-ultra-free',
+  'hy3-free',
 ];
 
-// 节点冷却时间(毫秒):429 后冷却 90 秒,过完自动恢复
-// opencode 限流时间窗口实测约 60-90 秒,设 90 秒保证恢复
-const COOLDOWN_MS = 90 * 1000;
+// 管理会话有效期:12 小时,滑动续期
+const SESSION_TTL = 12 * 60 * 60 * 1000;
 
-/**
- * 节点冷却管理器
- * 记录每个节点 429 的时间,冷却期内跳过该节点。
- * 这样连续请求时不会重复选到刚被限的节点,避免振荡。
- */
-class NodeCooldown {
-  constructor(logger) {
-    this.logger = logger;
-    this.cooldowns = new Map();  // node -> 429 时间戳
-  }
-  // 标记节点 429,进入冷却
-  mark429(node) {
-    this.cooldowns.set(node, Date.now());
-  }
-  // 节点是否在冷却中
-  isCooling(node) {
-    const t = this.cooldowns.get(node);
-    if (!t) return false;
-    if (Date.now() - t < COOLDOWN_MS) return true;
-    // 冷却结束,自动移除
-    this.cooldowns.delete(node);
-    return false;
-  }
-  // 节点成功使用,清除冷却记录
-  clear(node) {
-    this.cooldowns.delete(node);
-  }
-  // 从节点列表中选出第一个可用(未冷却)的
-  pickAvailable(nodes, excludeSet = null) {
-    for (const n of nodes) {
-      if (excludeSet && excludeSet.has(n)) continue;
-      if (this.isCooling(n)) continue;
-      return n;
-    }
-    return null;
-  }
-  // 状态摘要(供日志/界面用)
-  summary() {
-    const cooling = [];
-    for (const [node, t] of this.cooldowns) {
-      if (Date.now() - t < COOLDOWN_MS) {
-        cooling.push({ node, remain: Math.ceil((COOLDOWN_MS - (Date.now() - t)) / 1000) });
-      }
-    }
-    return cooling;
-  }
+/** 常量时间比较(防时序攻击) */
+function safeEqualStr(a, b) {
+  const ba = Buffer.from(String(a || ''));
+  const bb = Buffer.from(String(b || ''));
+  if (ba.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ba, bb);
 }
 
 /**
@@ -111,10 +78,7 @@ class UsageTracker {
     } catch (e) { this.logger?.('warn', `[usage] 加载用量数据失败: ${e.message}`); }
     return {
       total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
-      byDay: {},    // { "2026-08-02": { requests, success, fail, promptTokens, ... } }
-      byModel: {},  // { "deepseek-v4-flash-free": { requests, ... } }
-      lastRequest: null,
-      startTime: Date.now(),
+      byDay: {}, byModel: {}, lastRequest: null, startTime: Date.now(),
     };
   }
   save() {
@@ -123,40 +87,25 @@ class UsageTracker {
     } catch (e) { this.logger?.('warn', `[usage] 保存用量数据失败: ${e.message}`); }
   }
   record(model, usage, success) {
-    const day = new Date().toISOString().slice(0, 10);  // 2026-08-02
+    const day = new Date().toISOString().slice(0, 10);
     const pt = usage?.prompt_tokens || 0;
     const ct = usage?.completion_tokens || 0;
     const rt = usage?.completion_tokens_details?.reasoning_tokens || 0;
     const tt = usage?.total_tokens || (pt + ct);
 
-    // 总计
     const t = this.data.total;
-    t.requests++;
-    if (success) t.success++; else t.fail++;
-    t.promptTokens += pt;
-    t.completionTokens += ct;
-    t.reasoningTokens += rt;
-    t.totalTokens += tt;
+    t.requests++; if (success) t.success++; else t.fail++;
+    t.promptTokens += pt; t.completionTokens += ct; t.reasoningTokens += rt; t.totalTokens += tt;
 
-    // 按天
     if (!this.data.byDay[day]) this.data.byDay[day] = { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 };
     const d = this.data.byDay[day];
-    d.requests++;
-    if (success) d.success++; else d.fail++;
-    d.promptTokens += pt;
-    d.completionTokens += ct;
-    d.reasoningTokens += rt;
-    d.totalTokens += tt;
+    d.requests++; if (success) d.success++; else d.fail++;
+    d.promptTokens += pt; d.completionTokens += ct; d.reasoningTokens += rt; d.totalTokens += tt;
 
-    // 按模型
     if (!this.data.byModel[model]) this.data.byModel[model] = { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 };
     const m = this.data.byModel[model];
-    m.requests++;
-    if (success) m.success++; else m.fail++;
-    m.promptTokens += pt;
-    m.completionTokens += ct;
-    m.reasoningTokens += rt;
-    m.totalTokens += tt;
+    m.requests++; if (success) m.success++; else m.fail++;
+    m.promptTokens += pt; m.completionTokens += ct; m.reasoningTokens += rt; m.totalTokens += tt;
 
     this.data.lastRequest = Date.now();
     this.save();
@@ -171,89 +120,118 @@ class UsageTracker {
     };
   }
   reset() {
-    this.data = {
-      total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 },
-      byDay: {}, byModel: {}, lastRequest: null, startTime: Date.now(),
-    };
+    this.data = { total: { requests: 0, success: 0, fail: 0, promptTokens: 0, completionTokens: 0, reasoningTokens: 0, totalTokens: 0 }, byDay: {}, byModel: {}, lastRequest: null, startTime: Date.now() };
     this.save();
     this.logger?.('ok', '[usage] 用量统计已清零');
   }
 }
 
 class Gateway {
-  constructor(config, logger) {
-    this.config = config;       // { apiKey, port }
+  constructor(cfg, logger) {
+    this.config = cfg;          // 配置对象(可被 applyConfig 整体替换)
     this.logger = logger;       // (level, msg) => void
     this.server = null;
-    this.lastNodeFile = config.LAST_NODE_FILE;
-    this.nodeCache = null;      // 节点列表缓存
-    this.nodeCacheTime = 0;
-    this.switching = false;     // 切换中标记(避免并发切换)
-    this.cooldown = new NodeCooldown(logger);  // 节点冷却管理
-    this.lockedNode = null;     // 锁定节点:成功后锁定,后续请求优先用,直到 429 才换
-    this.paused = false;        // 暂停标志:重置/重启期间暂停接收请求,避免代理不可用导致断联
-    this.directMode = false;    // 直连模式:无代理节点时绕过 mihomo,直接连 opencode.ai
-    this.usage = new UsageTracker(config.USAGE_FILE, logger);  // token 用量统计
+    this.usage = new UsageTracker(config.USAGE_FILE, logger);
+    this.sessions = new Map();  // token -> expiresAt
+    this.agent = null;          // 懒构建的出站 agent(keep-alive 复用)
+    this.agentSig = '';         // 记录构建 agent 时的代理签名
   }
 
-  // ---- 暂停/恢复(重置或重启 mihomo 期间调用)----
-  pause() { this.paused = true; }
-  resume() { this.paused = false; }
+  // ---- 出站 agent(直连 / ProxyAgent)----
+  proxyLabel() {
+    const p = this.config.proxy;
+    if (!p || p.type === 'none') return '直连';
+    const auth = p.username ? `${p.username}:***@` : '';
+    return `${p.type}://${auth}${p.host}:${p.port}`;
+  }
+  proxySig(p) {
+    return `${p.type}|${p.host}|${p.port}|${p.username}|${p.password}`;
+  }
+  destroyAgent() {
+    if (this.agent) { try { this.agent.destroy(); } catch {} this.agent = null; }
+  }
+  buildAgent() {
+    const p = this.config.proxy;
+    const sig = this.proxySig(p);
+    if (!this.agent || this.agentSig !== sig) {
+      this.destroyAgent();
+      const base = { keepAlive: true, maxSockets: 16, keepAliveMsecs: 30000, rejectUnauthorized: false };
+      this.agent = (p.type === 'none' || !p.type)
+        ? new https.Agent(base)
+        : new ProxyAgent(p, base);
+      this.agentSig = sig;
+    }
+    return this.agent;
+  }
+  /** 应用新配置;代理变化时热重建 agent,其余字段即时生效 */
+  applyConfig(next) {
+    const old = this.config;
+    this.config = next;
+    if (this.proxySig(old.proxy) !== this.proxySig(next.proxy)) {
+      this.destroyAgent();
+      this.logger('info', `[config] 代理热更新 -> ${this.proxyLabel()}`);
+    }
+  }
+
+  // ---- 免费模型解析 ----
+  // config.freeModels 非空则用面板配置,否则回退内置默认;保证 /v1/models 恒非空
+  getFreeModels() {
+    const list = this.config.freeModels;
+    return (list && list.length) ? list : FREE_MODELS;
+  }
+  /** 模型归一化:白名单内透传,否则回退固定模型 */
+  resolveModel(model) {
+    return this.getFreeModels().includes(model) ? model : FIXED_MODEL;
+  }
+
+  // ---- 管理会话 ----
+  isAuthed(req) {
+    const token = req.headers['x-auth-token'];
+    if (!token) return false;
+    const exp = this.sessions.get(token);
+    if (!exp) return false;
+    if (Date.now() > exp) { this.sessions.delete(token); return false; }
+    this.sessions.set(token, Date.now() + SESSION_TTL); // 滑动续期
+    return true;
+  }
+  pruneSessions() {
+    const now = Date.now();
+    for (const [t, exp] of this.sessions) if (exp <= now) this.sessions.delete(t);
+  }
 
   // ---- 启动 HTTP 服务 ----
   start() {
     return new Promise((resolve, reject) => {
       this.server = http.createServer(async (req, res) => {
-        try {
-          await this.handle(req, res);
-        } catch (e) {
-          this.safe(res, 500, { error: { message: 'Internal: ' + e.message } });
-        }
+        try { await this.handle(req, res); }
+        catch (e) { this.safe(res, 500, { error: { message: 'Internal: ' + e.message } }); }
       });
 
       const tryListen = (port) => {
         this.server.removeAllListeners('error');
         this.server.on('error', (err) => {
           if (err.code === 'EADDRINUSE' && port < 65535) {
-            // 端口被占,自动试下一个
             this.logger('warn', `[gateway] 端口 ${port} 被占用,尝试 ${port + 1}`);
             tryListen(port + 1);
-          } else {
-            reject(err);
-          }
+          } else { reject(err); }
         });
-        this.server.listen(port, this.config.host || '127.0.0.1', () => {
+        this.server.listen(port, this.config.host || '0.0.0.0', () => {
           const addr = this.server.address();
           this.config.port = addr.port;
           this.logger('ok', `[gateway] 监听 ${addr.address}:${addr.port}`);
-          // 启动时恢复一次上次成功节点(后续请求不再调用,避免振荡)
-          this.restoreLastNode().catch(() => {});
           resolve(addr.port);
         });
       };
 
-      // 从配置的端口开始试(默认 9527),被占则递增
-      const startPort = this.config.port || 9527;
-      tryListen(startPort);
+      tryListen(this.config.port || 9527);
     });
-  }
-
-  // ---- 手动重置:清空所有冷却 + 锁定节点 ----
-  resetCooldowns() {
-    const count = this.cooldown.cooldowns.size;
-    this.cooldown.cooldowns.clear();
-    this.lockedNode = null;
-    this.nodeCache = null;       // 清空节点缓存,避免重置后仍用旧节点名
-    this.nodeCacheTime = 0;
-    this.logger('ok', `[reset] 已清空 ${count} 个节点冷却记录,重置锁定节点,清空节点缓存`);
-    return count;
   }
 
   stop() {
     return new Promise((resolve) => {
-      if (this.server) {
-        this.server.close(() => { this.server = null; resolve(); });
-      } else { resolve(); }
+      this.destroyAgent();
+      if (this.server) { this.server.close(() => { this.server = null; resolve(); }); }
+      else { resolve(); }
     });
   }
 
@@ -263,33 +241,56 @@ class Gateway {
     const p = u.pathname;
     const m = req.method;
 
-    // CORS(方便浏览器 agent 调用)
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Headers', '*');
     res.setHeader('Access-Control-Allow-Methods', '*');
     if (m === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    // 健康检查(不需要 key)
+    // 健康检查(免鉴权)
     if (p === '/health' && m === 'GET') {
-      return this.safe(res, 200, { ok: true, model: FIXED_MODEL, port: this.config.port });
+      return this.safe(res, 200, { ok: true, model: FIXED_MODEL, port: this.config.port, proxy: this.proxyLabel() });
     }
 
-    // 以下需要 Key
-    if (!this.checkKey(req)) {
-      return this.safe(res, 401, { error: { message: 'Invalid API key', type: 'auth_error' } });
+    // 管理面板(免鉴权,登录由前端完成)
+    if (p === '/' && m === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      return res.end(UI_HTML);
     }
 
-    // 暂停中(重置/重启 mihomo 期间):返回 503 让客户端重试,而不是因代理不可用导致断联
-    if (this.paused) {
-      res.setHeader('Retry-After', '10');
-      return this.safe(res, 503, { error: { message: 'Gateway is resetting, please retry in a few seconds', type: 'gateway_paused' } });
+    // 登录(免鉴权)
+    if (p === '/api/login' && m === 'POST') {
+      return this.apiLogin(req, res);
     }
 
-    if (p === '/v1/models' && m === 'GET') {
-      return this.handleModels(res);
+    // /api/* 管理接口:token 鉴权
+    if (p.startsWith('/api/')) {
+      if (!this.isAuthed(req)) {
+        return this.safe(res, 401, { error: { message: 'Unauthorized', type: 'auth_error' } });
+      }
+      if (p === '/api/config' && m === 'GET') {
+        const s = config.sanitize(this.config);
+        s.freeModels = this.getFreeModels(); // 回传实际生效的模型列表(含默认兜底)
+        return this.safe(res, 200, s);
+      }
+      if (p === '/api/config' && m === 'PUT') {
+        return this.apiUpdateConfig(req, res);
+      }
+      if (p === '/api/test' && m === 'POST') {
+        return this.safe(res, 200, await this.apiTest());
+      }
+      if (p === '/api/stats' && m === 'GET') {
+        return this.safe(res, 200, this.getStats());
+      }
+      return this.safe(res, 404, { error: { message: `Not found: ${m} ${p}` } });
     }
-    if (p === '/v1/chat/completions' && m === 'POST') {
-      return this.handleChat(req, res);
+
+    // /v1/* 客户端 API:API Key 鉴权
+    if (p.startsWith('/v1/')) {
+      if (!this.checkKey(req)) {
+        return this.safe(res, 401, { error: { message: 'Invalid API key', type: 'auth_error' } });
+      }
+      if (p === '/v1/models' && m === 'GET') return this.handleModels(res);
+      if (p === '/v1/chat/completions' && m === 'POST') return this.handleChat(req, res);
     }
 
     this.safe(res, 404, { error: { message: `Not found: ${m} ${p}` } });
@@ -297,14 +298,97 @@ class Gateway {
 
   checkKey(req) {
     const k = req.headers['authorization'] || '';
-    const m = k.match(/^Bearer\s+(.+)$/i);
-    if (!m) return false;
-    return m[1] === this.config.apiKey;
+    const mm = k.match(/^Bearer\s+(.+)$/i);
+    if (!mm) return false;
+    return mm[1] === this.config.apiKey;
+  }
+
+  // ---- 面板登录 ----
+  async apiLogin(req, res) {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    let body;
+    try { body = JSON.parse(raw); } catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
+    const pass = typeof body.password === 'string' ? body.password : '';
+    if (!safeEqualStr(pass, this.config.adminPassword)) {
+      this.logger('warn', '[login] 密码错误');
+      return this.safe(res, 401, { error: { message: '密码错误' } });
+    }
+    this.pruneSessions();
+    const token = crypto.randomBytes(24).toString('hex');
+    this.sessions.set(token, Date.now() + SESSION_TTL);
+    this.logger('ok', '[login] 管理面板登录成功');
+    return this.safe(res, 200, { ok: true, token });
+  }
+
+  // ---- 修改配置(含哨兵保持原值)----
+  async apiUpdateConfig(req, res) {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    let body;
+    try { body = JSON.parse(raw); } catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
+
+    const next = { ...this.config, proxy: { ...this.config.proxy } };
+    if (typeof body.apiKey === 'string' && body.apiKey.trim()) next.apiKey = body.apiKey.trim();
+    // adminPassword:'********'(或空)视为保持原值
+    if (typeof body.adminPassword === 'string' && body.adminPassword && body.adminPassword !== '********') next.adminPassword = body.adminPassword;
+    if (typeof body.port === 'number' && body.port >= 1 && body.port <= 65535) next.port = body.port;
+    if (typeof body.host === 'string' && body.host.trim()) next.host = body.host.trim();
+
+    const pc = (body.proxy && typeof body.proxy === 'object') ? body.proxy : {};
+    next.proxy = config.normalizeProxy({
+      type: pc.type !== undefined ? pc.type : next.proxy.type,
+      host: pc.host !== undefined ? pc.host : next.proxy.host,
+      port: pc.port !== undefined ? pc.port : next.proxy.port,
+      username: pc.username !== undefined ? pc.username : next.proxy.username,
+      password: (pc.password && pc.password !== '********') ? pc.password : next.proxy.password,
+    });
+
+    // 免费模型白名单:数组则归一化存储(空数组=回退内置默认);其余忽略
+    if (Array.isArray(body.freeModels)) {
+      next.freeModels = config.normalizeFreeModels(body.freeModels);
+    }
+
+    config.ensureAdminPassword(next); // 保证密码非空
+    config.save(next);
+
+    const portChanged = next.port !== this.config.port || next.host !== this.config.host;
+    this.applyConfig(next);
+
+    const out = config.sanitize(next);
+    out.freeModels = this.getFreeModels(); // 回传实际生效的模型列表(含默认兜底)
+    const msg = portChanged ? '已保存(端口/监听地址改动重启后生效)' : '已保存并热生效';
+    this.logger('ok', `[config] 更新: ${msg} 免费模型 x${out.freeModels.length}`);
+    return this.safe(res, 200, { ok: true, message: msg, config: out });
+  }
+
+  // ---- 测试上游连通(走当前 agent,任何 HTTP 响应即视为连通)----
+  apiTest() {
+    const t0 = Date.now();
+    const agent = this.buildAgent();
+    const label = this.proxyLabel();
+    return new Promise((resolve) => {
+      const url = new URL(OPENCODE_MODELS);
+      const req = https.request({
+        hostname: url.hostname,
+        port: 443,
+        path: url.pathname,
+        method: 'GET',
+        agent,
+        timeout: 15000,
+      }, (resp) => {
+        resp.resume();
+        resolve({ ok: true, ms: Date.now() - t0, status: resp.statusCode, type: label });
+      });
+      req.on('error', (e) => resolve({ ok: false, ms: Date.now() - t0, error: e.message, type: label }));
+      req.on('timeout', () => { req.destroy(); resolve({ ok: false, ms: Date.now() - t0, error: 'timeout(15s)', type: label }); });
+      req.end();
+    });
   }
 
   // ---- /v1/models ----
   handleModels(res) {
-    const data = FREE_MODELS.map(id => ({
+    const data = this.getFreeModels().map(id => ({
       id,
       object: 'model',
       created: 1700000000,
@@ -313,7 +397,7 @@ class Gateway {
     this.safe(res, 200, { object: 'list', data });
   }
 
-  // ---- /v1/chat/completions ----
+  // ---- /v1/chat/completions(单上游,429 透传 Retry-After)----
   async handleChat(req, res) {
     let raw = '';
     for await (const chunk of req) raw += chunk;
@@ -321,200 +405,48 @@ class Gateway {
     try { body = JSON.parse(raw); }
     catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
 
-    // 强制固定模型(忽略客户端传的)
-    body.model = FIXED_MODEL;
+    body.model = this.resolveModel(body.model); // 白名单内模型透传,否则回退固定模型
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
       return this.safe(res, 400, { error: { message: 'messages required' } });
     }
-    // 不支持流式时强制非流式(简化实现)
     const wantStream = body.stream === true;
-    body.stream = false;
 
     const clientIp = req.socket.remoteAddress;
-    this.logger('info', `[chat] from=${clientIp} msgs=${body.messages.length} stream=${wantStream}`);
+    this.logger('info', `[chat] from=${clientIp} msgs=${body.messages.length} stream=${wantStream} proxy=${this.proxyLabel()}`);
 
-    // 列出可用代理节点;无节点时进入直连模式(订阅是可选项)
-    const nodes = await this.getAllNodes();
-    this.directMode = nodes.length === 0;
-    if (this.directMode) {
-      this.logger('warn', '[chat] 无代理节点,使用直连模式(不走 mihomo)');
-      try {
-        if (wantStream) {
-          await this.forwardStream(res, body, req);
-        } else {
-          const result = await this.forwardToOpenCode(body);
-          this.usage.record(FIXED_MODEL, result.usage, true);
-          return this.safe(res, 200, result);
-        }
+    try {
+      if (wantStream) {
+        await this.forwardStream(res, body, req);
+      } else {
+        const result = await this.forwardToOpenCode(body);
+        this.usage.record(body.model, result.usage, true);
+        this.logger('ok', `[ok] tokens=${result.usage?.total_tokens}`);
+        return this.safe(res, 200, result);
+      }
+    } catch (e) {
+      const status = e.status || 0;
+      const notStarted = e.notStarted !== false; // 流式是否已开始发数据
+      if (!notStarted) {
+        // 已开始流式转发后出错:不能切换,直接返回错误让 agent 重试
+        this.logger('error', `[stream-mid] 流式中断: ${e.body || e.message}`);
+        try { this.safe(res, 502, { error: { message: 'Stream interrupted' } }); } catch {}
         return;
-      } catch (e) {
-        const status = e.status || 0;
-        if (!e.notStarted) {
-          this.logger('error', `[direct] 流式中断: ${e.body || e.message}`);
-          try { this.safe(res, 502, { error: { message: 'Stream interrupted' } }); } catch {}
-          return;
-        }
-        this.logger('error', `[direct] 直连失败: ${e.body || e.message}`);
-        if (status === 429) {
-          return this.safe(res, 429, { error: { message: 'Rate limited (direct mode)', type: 'rate_limited' } });
-        }
-        return this.safe(res, status || 502, { error: { message: e.body || e.message } });
       }
-    }
-
-    // ---- 有代理节点:429/超时则换节点重试 ----
-
-    // ---- 节点选择策略 ----
-    // 核心原则:一个 IP 能用就一直用,直到 429 才换。
-    // lockedNode:上次成功锁定的节点,后续请求直接用,不重新选择
-    let cur = this.lockedNode;
-    if (!cur || this.cooldown.isCooling(cur)) {
-      cur = this.cooldown.pickAvailable(nodes);
-      if (!cur) {
-        // 全部冷却中:选剩余冷却时间最短的
-        let bestNode = null, bestRemain = Infinity;
-        for (const n of nodes) {
-          const t = this.cooldown.cooldowns.get(n);
-          if (t) {
-            const remain = COOLDOWN_MS - (Date.now() - t);
-            if (remain < bestRemain) { bestRemain = remain; bestNode = n; }
-          }
-        }
-        if (bestNode && bestRemain > 0) {
-          this.logger('warn', `[cooldown] 所有节点冷却中,等待 ${bestNode} 恢复(剩 ${Math.ceil(bestRemain/1000)}s)`);
-          await sleep(bestRemain + 1000);
-          cur = bestNode;
-          this.cooldown.cooldowns.delete(cur);
-        } else {
-          cur = nodes[0];
-        }
+      this.logger('error', `[chat] 转发失败 HTTP ${status}: ${e.body || e.message}`);
+      if (status === 429) {
+        res.setHeader('Retry-After', '60');
+        return this.safe(res, 429, { error: { message: 'Rate limited, retry in ~60s', type: 'rate_limited' } });
       }
-      const curMihomo = await this.getCurrentNode();
-      if (curMihomo !== cur) {
-        const ok = await this.switchNode(cur);
-        if (!ok) {
-          this.cooldown.mark429(cur);
-          return this.safe(res, 503, { error: { message: 'Switch node failed' } });
-        }
+      if (status === 0) {
+        return this.safe(res, 502, { error: { message: `上游连接失败: ${e.body || e.message}`, type: 'upstream_error' } });
       }
-    }
-
-    // 本次请求内已尝试过的节点(429 或网络错误耗尽后切换)
-    const localTried = new Set();
-    let curRetry = 0;          // 当前节点网络错误重试计数
-    const MAX_NET_RETRY = 2;
-    let attempt = 0;
-
-    while (true) {
-      attempt++;
-      if (attempt > nodes.length + 5) {
-        this.logger('error', `[chat] 重试次数耗尽`);
-        return this.safe(res, 503, {
-          error: { message: 'All nodes unavailable after retries', type: 'all_nodes_unavailable' },
-        });
-      }
-
-      const t0 = Date.now();
-      try {
-        if (wantStream) {
-          // ---- 流式:直接管道转发 opencode 的 SSE ----
-          // notStarted=true 表示还没开始发数据(429/网络错误),可以安全切换重试
-          // notStarted=false 或正常 resolve 表示已开始/完成,不能再切换
-          await this.forwardStream(res, body, req);
-          const dt = Date.now() - t0;
-          this.lockedNode = cur;
-          this.cooldown.clear(cur);
-          this.saveLastNode(cur);
-          this.logger('ok', `[stream-ok] node="${cur}" ${dt}ms`);
-          return;
-        } else {
-          // ---- 非流式 ----
-          const result = await this.forwardToOpenCode(body);
-          const dt = Date.now() - t0;
-          this.lockedNode = cur;
-          this.cooldown.clear(cur);
-          this.saveLastNode(cur);
-          curRetry = 0;
-          this.usage.record(FIXED_MODEL, result.usage, true);
-          this.logger('ok', `[ok] node="${cur}" ${dt}ms tokens=${result.usage?.total_tokens}`);
-          return this.safe(res, 200, result);
-        }
-      } catch (e) {
-        const status = e.status || 0;
-        const notStarted = e.notStarted !== false;  // 流式是否还没开始发数据
-
-        // 已经开始流式转发后出错:不能切换,直接返回错误让 agent 重试
-        if (!notStarted) {
-          this.logger('error', `[stream-mid] node="${cur}" 流式中断: ${e.body || e.message}`);
-          try { this.safe(res, 502, { error: { message: 'Stream interrupted' } }); } catch {}
-          return;
-        }
-
-        // 429 = 真正限额:标记冷却,切下一个可用节点
-        if (status === 429) {
-          this.cooldown.mark429(cur);
-          this.logger('warn', `[429] node="${cur}" 限流,冷却 ${COOLDOWN_MS/1000}s`);
-          localTried.add(cur);
-          curRetry = 0;
-
-          let next = this.cooldown.pickAvailable(nodes, localTried);
-          if (!next) {
-            const summary = this.cooldown.summary();
-            this.logger('error', `[chat] 全部节点冷却中: ${summary.length} 个`);
-            return this.safe(res, 429, {
-              error: {
-                message: `All nodes rate-limited, retry in ~${summary[0]?.remain || 90}s`,
-                type: 'all_nodes_429',
-                cooldown: summary,
-              },
-            });
-          }
-          // 切节点前等 2 秒:避免重置后快速遍历全部节点导致全部 429(给上游限流恢复时间)
-          await sleep(2000);
-          const ok = await this.switchNode(next);
-          if (ok) { cur = next; }
-          else { localTried.add(next); }
-          continue;
-        }
-
-        // status=0 = 网络错误:只重试当前节点,不切换(避免振荡)
-        if (status === 0) {
-          curRetry++;
-          if (curRetry <= MAX_NET_RETRY) {
-            this.logger('warn', `[net-retry ${curRetry}/${MAX_NET_RETRY}] node="${cur}" 网络错误,重试当前节点`);
-            await sleep(1000);
-            continue;
-          }
-          localTried.add(cur);
-          curRetry = 0;
-          this.logger('warn', `[timeout] node="${cur}" 重试 ${MAX_NET_RETRY} 次仍失败,切下一个`);
-          let next = this.cooldown.pickAvailable(nodes, localTried);
-          if (!next) {
-            return this.safe(res, 504, { error: { message: 'All nodes timeout' } });
-          }
-          const ok = await this.switchNode(next);
-          if (ok) { cur = next; }
-          else { localTried.add(next); }
-          continue;
-        }
-
-        // 其他 HTTP 错误(400/500 等):不切节点,直接返回
-        this.logger('error', `[chat] HTTP ${status}: ${e.body}`);
-        return this.safe(res, status, e.body ? JSON.parse(e.body) : { error: { message: `HTTP ${status}` } });
-      }
+      let parsed;
+      try { parsed = JSON.parse(e.body); } catch { parsed = { error: { message: e.body || `HTTP ${status}` } }; }
+      return this.safe(res, status, parsed);
     }
   }
 
-  // ---- 转发到 opencode(非流式,通过 mihomo 代理)----
-  // 直连模式(directMode=true)时不走本地 mihomo 代理。
-  buildAgent() {
-    const opts = { rejectUnauthorized: false };
-    if (!this.directMode) {
-      opts.proxy = `http://127.0.0.1:${MIHOMO_PROXY_PORT}`;
-    }
-    return new https.Agent(opts);
-  }
-
+  // ---- 转发到 opencode(非流式)----
   forwardToOpenCode(body) {
     return new Promise((resolve, reject) => {
       const bodyStr = JSON.stringify(body);
@@ -527,10 +459,10 @@ class Gateway {
         headers: {
           'Content-Type': 'application/json',
           'Accept': '*/*',
-          'User-Agent': 'node',
+          'User-Agent': OPENCODE_HEADERS['User-Agent'],
+          'X-Opencode-Client': OPENCODE_HEADERS['X-Opencode-Client'],
           'Content-Length': Buffer.byteLength(bodyStr),
         },
-        // 直连模式不走本地代理;否则走 mihomo
         agent: this.buildAgent(),
         timeout: 60000,
       };
@@ -554,12 +486,10 @@ class Gateway {
     });
   }
 
-  // ---- 流式管道转发 opencode 的 SSE(不做任何拆分,原样透传)----
-  // 关键:开始转发前(状态码!=200)可以安全切换节点重试;
-  //       开始转发后(已 writeHead)不能切换,只能让 agent 重试整个请求。
+  // ---- 流式管道转发 opencode 的 SSE(原样透传)----
   forwardStream(res, body, req) {
     return new Promise((resolve, reject) => {
-      body.stream = true;  // 确保向 opencode 请求流式
+      body.stream = true;
       const bodyStr = JSON.stringify(body);
       const url = new URL(OPENCODE_ENDPOINT);
       const opts = {
@@ -570,30 +500,26 @@ class Gateway {
         headers: {
           'Content-Type': 'application/json',
           'Accept': 'text/event-stream',
-          'User-Agent': 'node',
+          'User-Agent': OPENCODE_HEADERS['User-Agent'],
+          'X-Opencode-Client': OPENCODE_HEADERS['X-Opencode-Client'],
           'Content-Length': Buffer.byteLength(bodyStr),
         },
         agent: this.buildAgent(),
-        timeout: 300000,  // 流式请求超时 5 分钟(thinking 模式推理较慢)
+        timeout: 300000, // 流式 5 分钟(thinking 模式推理较慢)
       };
 
-      // 客户端断开标记:防止客户端断开后继续往 res 写数据
       let clientGone = false;
       let upstreamReq = null;
-
-      // 监听客户端断开:主动终止上游连接,避免 aborted 错误
       const onClientClose = () => {
         clientGone = true;
-        if (upstreamReq) {
-          try { upstreamReq.destroy(); } catch {}
-        }
+        if (upstreamReq) { try { upstreamReq.destroy(); } catch {} }
       };
       req.on('close', onClientClose);
       req.on('aborted', onClientClose);
 
       upstreamReq = https.request(opts, (resp) => {
         if (resp.statusCode !== 200) {
-          // 非 200(可能是 429):收集完整 body 用于判断错误,还没 writeHead,可以安全重试
+          // 非 200(如 429):收集 body 判断错误,尚未 writeHead,可安全返回错误
           let data = '';
           resp.on('data', c => data += c);
           resp.on('end', () => {
@@ -604,9 +530,8 @@ class Gateway {
           return;
         }
 
-        // 客户端已断开:不需要 writeHead,直接结束
         if (clientGone) {
-          this.logger('info', `[stream] 客户端已断开,取消上游响应`);
+          this.logger('info', '[stream] 客户端已断开,取消上游响应');
           try { resp.destroy(); } catch {}
           req.off('close', onClientClose);
           req.off('aborted', onClientClose);
@@ -614,29 +539,23 @@ class Gateway {
           return;
         }
 
-        // 200:开始流式转发,设置 SSE headers
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
           'Connection': 'keep-alive',
         });
 
-        // 拦截 SSE 数据提取 usage(不修改数据,原样转发给客户端)
+        // 拦截 SSE 数据提取 usage(不改数据,原样转发)
         let sseBuffer = '';
         let capturedUsage = null;
 
         resp.on('data', (chunk) => {
-          // 客户端已断开:不再写数据,主动终止上游
-          if (clientGone) {
-            try { resp.destroy(); } catch {}
-            return;
-          }
+          if (clientGone) { try { resp.destroy(); } catch {} return; }
           try { res.write(chunk); } catch {}
-          // 解析 SSE 行,提取 usage(通常在最后一个 chunk 中)
           try {
             sseBuffer += chunk.toString();
             const lines = sseBuffer.split('\n');
-            sseBuffer = lines.pop();  // 保留最后不完整的行
+            sseBuffer = lines.pop();
             for (const line of lines) {
               if (line.startsWith('data: ') && !line.includes('[DONE]')) {
                 const json = JSON.parse(line.slice(6));
@@ -649,28 +568,21 @@ class Gateway {
         resp.on('end', () => {
           req.off('close', onClientClose);
           req.off('aborted', onClientClose);
-          if (!res.writableEnded) {
-            try { res.end(); } catch {}
-          }
-          if (capturedUsage) {
-            this.usage.record(FIXED_MODEL, capturedUsage, true);
-          }
+          if (!res.writableEnded) { try { res.end(); } catch {} }
+          if (capturedUsage) this.usage.record(body.model, capturedUsage, true);
           resolve();
         });
 
         resp.on('error', (e) => {
           req.off('close', onClientClose);
           req.off('aborted', onClientClose);
-          // 客户端主动断开导致的 aborted 不是错误,降级为 info
           if (clientGone || e.message === 'aborted' || e.code === 'ECONNRESET') {
             this.logger('info', `[stream] 客户端断开或连接重置,已清理上游连接`);
           } else {
             this.logger('warn', `[stream] 上游错误: ${e.message}`);
           }
-          if (!res.writableEnded) {
-            try { res.end(); } catch {}
-          }
-          resolve();  // 已经发了一部分,不算失败
+          if (!res.writableEnded) { try { res.end(); } catch {} }
+          resolve();
         });
       });
 
@@ -679,7 +591,6 @@ class Gateway {
         req.off('aborted', onClientClose);
         reject({ status: 0, body: e.message, notStarted: true });
       });
-
       upstreamReq.on('timeout', () => {
         upstreamReq.destroy();
         req.off('close', onClientClose);
@@ -692,115 +603,25 @@ class Gateway {
     });
   }
 
-  // ---- mihomo 控制 ----
-  async getAllNodes() {
-    // 缓存 30 秒
-    if (this.nodeCache && Date.now() - this.nodeCacheTime < 30000) {
-      return this.nodeCache;
-    }
-    try {
-      const r = await this.mihomoApi(`/proxies/${POOL_NAME}`);
-      const all = r.all || [];
-      this.nodeCache = all;
-      this.nodeCacheTime = Date.now();
-      return all;
-    } catch (e) {
-      this.logger('error', `[mihomo] 获取节点失败: ${e.message}`);
-      return [];
-    }
+  // ---- 状态/用量 ----
+  getStats() {
+    const usage = this.usage.getStats();
+    return {
+      uptime: Date.now() - usage.startTime,
+      usage,
+      proxy: this.proxyLabel(),
+      model: FIXED_MODEL,
+      port: this.config.port,
+      apiKey: this.config.apiKey,
+    };
   }
-
-  async getCurrentNode() {
-    try {
-      const r = await this.mihomoApi(`/proxies/${POOL_NAME}`);
-      return r.now;
-    } catch { return null; }
-  }
-
-  async switchNode(name) {
-    // 并发时等待前一次切换完成(而非直接返回 false)
-    while (this.switching) {
-      await sleep(100);
-      // 切换完成后,检查当前节点是否已经是目标节点
-      const cur = await this.getCurrentNode();
-      if (cur === name) return true;
-    }
-    this.switching = true;
-    try {
-      const body = JSON.stringify({ name });
-      await this.mihomoApi(`/proxies/${POOL_NAME}`, 'PUT', body);
-      await sleep(1000);  // 切换后等 1 秒,确保新节点连接建立
-      this.logger('info', `[switch] -> ${name}`);
-      return true;
-    } catch (e) {
-      this.logger('error', `[switch] 失败: ${e.message}`);
-      return false;
-    } finally {
-      this.switching = false;
-    }
-  }
-
-  mihomoApi(p, method = 'GET', body = null) {
-    return new Promise((resolve, reject) => {
-      const req = http.request({
-        hostname: '127.0.0.1',
-        port: MIHOMO_CTRL_PORT,
-        path: p,
-        method,
-        headers: body ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } : {},
-        timeout: 5000,
-      }, (resp) => {
-        let data = '';
-        resp.on('data', c => data += c);
-        resp.on('end', () => {
-          if (resp.statusCode >= 200 && resp.statusCode < 300) {
-            if (method === 'GET') {
-              try { resolve(JSON.parse(data)); }
-              catch { resolve({}); }
-            } else { resolve({}); }
-          } else {
-            reject(new Error(`HTTP ${resp.statusCode}`));
-          }
-        });
-      });
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-      if (body) req.write(body);
-      req.end();
-    });
-  }
-
-  async restoreLastNode() {
-    if (!fs.existsSync(this.lastNodeFile)) return;
-    const last = fs.readFileSync(this.lastNodeFile, 'utf8').trim();
-    if (!last) return;
-    const cur = await this.getCurrentNode();
-    if (cur === last) return;
-    const nodes = await this.getAllNodes();
-    if (nodes.includes(last)) {
-      this.logger('info', `[memo] 恢复上次节点: ${last}`);
-      await this.switchNode(last);
-    }
-  }
-
-  saveLastNode(name) {
-    try { fs.writeFileSync(this.lastNodeFile, name, 'utf8'); } catch {}
-  }
-
-  getUsage() {
-    return this.usage.getStats();
-  }
-
-  resetUsage() {
-    this.usage.reset();
-  }
+  getUsage() { return this.usage.getStats(); }
+  resetUsage() { this.usage.reset(); }
 
   safe(res, status, obj) {
     res.writeHead(status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(obj));
   }
 }
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 module.exports = { Gateway, FIXED_MODEL };
