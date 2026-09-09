@@ -98,6 +98,13 @@ function applyEnvAndInit(cfg) {
     }
   }
 
+  // ZEN_UPSTREAM_KEY:opencode.ai API Key(环境变量注入,面板可覆盖)
+  if (process.env.ZEN_UPSTREAM_KEY) {
+    cfg.upstreamKey = process.env.ZEN_UPSTREAM_KEY.trim();
+    changed = true;
+    log('info', '[init] 使用环境变量上游 Key: ' + cfg.upstreamKey.slice(0, 8) + '***...');
+  }
+
   if (!cfg.apiKey) {
     cfg.apiKey = config.genApiKey();
     changed = true;
@@ -142,6 +149,7 @@ async function bootstrap() {
   console.log(`│ API Key:  ${String(cfg.apiKey).padEnd(28)}│`);
   console.log(`│ 模型:     ${FIXED_MODEL.padEnd(28)}│`);
   console.log(`│ 出站:     ${String(gateway.proxyLabel()).padEnd(28)}│`);
+  console.log(`│ 上游 Key: ${(cfg.upstreamKey ? cfg.upstreamKey.slice(0,8)+'***' : '未设置').padEnd(28)}│`);
   console.log('└──────────────────────────────────────────────┘');
   log('info', `[gateway] 配置目录: ${config.CONFIG_FILE}`);
 
@@ -160,6 +168,7 @@ async function bootstrap() {
     `Base URL:  ${panelUrl}/v1`,
     `API Key:   ${cfg.apiKey}`,
     `Model:     ${FIXED_MODEL}`,
+    `上游 Key:  ${cfg.upstreamKey || '(未设置)'}`,
     `数据目录:  ${config.CONFIG_FILE}`,
     `生成时间:  ${new Date().toISOString()}`,
     '',

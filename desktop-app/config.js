@@ -15,7 +15,8 @@
  *     "password": "",
  *     "pool": []                    // 代理池(仅 http_pool / socks5_pool 使用)
  *   },
- *   "freeModels": []                // 免费模型白名单(空则回退内置默认,热加载)
+ *   "freeModels": [],                // 免费模型白名单(空则回退内置默认,热加载)
+ *   "upstreamKey": ""                // opencode.ai API Key(sk-xxx),网关转发时带 Authorization;留空则不带
  * }
  *
  * 代理池条目(pool[])与单个代理结构一致,type 恒为 http 或 socks5。
@@ -48,6 +49,7 @@ const DEFAULT_CONFIG = {
   host: '0.0.0.0',
   proxy: { type: 'none', host: '', port: 0, username: '', password: '', pool: [] },
   freeModels: [],
+  upstreamKey: '',
 };
 
 const PROXY_TYPES = ['http', 'socks5', 'none', 'http_pool', 'socks5_pool'];
@@ -207,6 +209,8 @@ function sanitize(cfg) {
       })),
     },
     freeModels: normalizeFreeModels(cfg.freeModels),
+    upstreamKey: cfg.upstreamKey ? cfg.upstreamKey.slice(0, 8) + '***' + cfg.upstreamKey.slice(-4) : '',
+    // 会话 ID 不加密但也不在前端展示(仅回传做占位)
     // 不回传 adminPassword(前端不展示,也无法从配置读取)
   };
 }

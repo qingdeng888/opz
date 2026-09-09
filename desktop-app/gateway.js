@@ -6,7 +6,8 @@
  *   GET  /                      管理面板 HTML(免鉴权)
  *   POST /api/login             面板登录(免鉴权) -> token
  *   GET|PUT /api/config         查看/修改配置(token 鉴权)
- *   POST /api/test              测试上游连通(token 鉴权)
+ *   POST /api/test              连通性测试(token 鉴权)
+ *                               type=connect 基础连通(默认) / type=model 真实模型对话
  *   GET  /v1/models             模型列表(API Key 鉴权)
  *   POST /v1/chat/completions   聊天补全,SSE 流式(API Key 鉴权)
  *
@@ -25,27 +26,43 @@ const UI_HTML = require('./ui');
 
 const OPENCODE_ENDPOINT = 'https://opencode.ai/zen/v1/chat/completions';
 const OPENCODE_MODELS = 'https://opencode.ai/zen/v1/models';
-const FIXED_MODEL = 'deepseek-v4-flash-free';
+const FIXED_MODEL = 'mimo-v2.5-free';
 
-// opencode.ai 官方客户端请求头
-// 实测:带上这两个头可被服务端识别为 opencode CLI 客户端,显著降低免费额度限流(429 FreeUsageLimitError)概率
-const OPENCODE_HEADERS = {
-  'User-Agent': 'opencode/1.18.12 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13',
-  'X-Opencode-Client': 'cli',
-};
+// 面板「模型对话测试」的默认提问;用户可在面板自定义
+const DEFAULT_TEST_MESSAGE = '你是谁，出来干活了';
+// 诊断类请求的 token 上限:够模型作答即可,避免测试消耗过多免费额度
+const TEST_MAX_TOKENS = 512;
+
+// 构建出站请求头(每次请求随机生成伪会话 ID,避免固定 ID 触发风控)
+function buildUpstreamHeaders(cfg) {
+  const h = {
+    'Content-Type': 'application/json',
+    'Accept': '*/*',
+    'User-Agent': 'opencode/1.18.30 ai-sdk/provider-utils runtime/bun',
+    'X-Opencode-Client': 'cli',
+    'x-opencode-session': 'ses_' + crypto.randomUUID(),
+    'x-opencode-request': 'usr_' + crypto.randomUUID(),
+    'x-opencode-project': 'prj_' + crypto.randomUUID(),
+  };
+  if (cfg.upstreamKey) {
+    h['Authorization'] = 'Bearer ' + cfg.upstreamKey;
+  }
+  return h;
+}
 
 // 免费模型默认白名单(config.freeModels 为空时兜底)
 // 免费模型白名单(供 /v1/models 返回)
 // 用户可在管理面板增删(存 config.freeModels,热加载生效),这里保留一份出厂默认
+// 校准依据:opencode CLI 1.18.30 `opencode models` 列出的 opencode/* 免费模型
+// (2026-09-09 实测;上游免费模型变动频繁,失配时以 CLI 输出为准)
 const FREE_MODELS = [
-  'deepseek-v4-flash-free',
   'big-pickle',
+  'ling-3.0-flash-fin-free',
   'mimo-v2.5-free',
-  'laguna-s-2.1-free',
-  'ling-3.0-flash-free',
-  'north-mini-code-free',
+  'muse-spark-1.2-contributor-free',
+  'muse-spark-1.3-contributor-free',
   'nemotron-3-ultra-free',
-  'hy3-free',
+  'nemotron-3.5-lightning-free',
 ];
 
 // 管理会话有效期:12 小时,滑动续期
@@ -57,6 +74,14 @@ function safeEqualStr(a, b) {
   const bb = Buffer.from(String(b || ''));
   if (ba.length !== bb.length) return false;
   return crypto.timingSafeEqual(ba, bb);
+}
+
+/** 读取请求体并解析 JSON;空体视为 {},非法 JSON 返回 null */
+async function readJsonBody(req) {
+  let raw = '';
+  for await (const chunk of req) raw += chunk;
+  if (!raw.trim()) return {};
+  try { return JSON.parse(raw); } catch { return null; }
 }
 
 /**
@@ -287,7 +312,7 @@ class Gateway {
         return this.apiUpdateConfig(req, res);
       }
       if (p === '/api/test' && m === 'POST') {
-        return this.safe(res, 200, await this.apiTest());
+        return this.apiTest(req, res);
       }
       if (p === '/api/stats' && m === 'GET') {
         return this.safe(res, 200, this.getStats());
@@ -316,10 +341,8 @@ class Gateway {
 
   // ---- 面板登录 ----
   async apiLogin(req, res) {
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    let body;
-    try { body = JSON.parse(raw); } catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
+    const body = await readJsonBody(req);
+    if (body === null) return this.safe(res, 400, { error: { message: 'Invalid JSON' } });
     const pass = typeof body.password === 'string' ? body.password : '';
     if (!safeEqualStr(pass, this.config.adminPassword)) {
       this.logger('warn', '[login] 密码错误');
@@ -334,10 +357,8 @@ class Gateway {
 
   // ---- 修改配置(含哨兵保持原值)----
   async apiUpdateConfig(req, res) {
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    let body;
-    try { body = JSON.parse(raw); } catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
+    const body = await readJsonBody(req);
+    if (body === null) return this.safe(res, 400, { error: { message: 'Invalid JSON' } });
 
     const next = { ...this.config, proxy: { ...this.config.proxy } };
     if (typeof body.apiKey === 'string' && body.apiKey.trim()) next.apiKey = body.apiKey.trim();
@@ -374,6 +395,11 @@ class Gateway {
       next.freeModels = config.normalizeFreeModels(body.freeModels);
     }
 
+    // 上游 API Key(sk-xxx):空/脱敏哨兵保持原值
+    if (typeof body.upstreamKey === 'string' && body.upstreamKey && body.upstreamKey !== '********') {
+      next.upstreamKey = body.upstreamKey.trim();
+    }
+
     config.ensureAdminPassword(next); // 保证密码非空
     config.save(next);
 
@@ -387,8 +413,19 @@ class Gateway {
     return this.safe(res, 200, { ok: true, message: msg, config: out });
   }
 
-  // ---- 测试上游连通(走当前 agent,任何 HTTP 响应即视为连通)----
-  apiTest() {
+  // ---- 连通性测试(POST /api/test)----
+  // body.type = 'connect' 基础连通:GET /zen/v1/models,只验证网络与代理通路(向后兼容默认)
+  // body.type = 'model'   模型对话:真实发一条 chat/completions,验证所选模型能否作答
+  async apiTest(req, res) {
+    const body = await readJsonBody(req);
+    if (body === null) return this.safe(res, 400, { error: { message: 'Invalid JSON' } });
+
+    if (body.type === 'model') return this.apiTestModel(res, body);
+    return this.safe(res, 200, await this.apiTestConnect());
+  }
+
+  // 基础连通:走当前 agent,任何 HTTP 响应即视为网络可达
+  apiTestConnect() {
     const t0 = Date.now();
     const agent = this.buildAgent();
     const label = this.proxyLabel();
@@ -411,6 +448,54 @@ class Gateway {
     });
   }
 
+  /**
+   * 模型对话测试:向上游真实发一条消息,回传模型答复供面板展示。
+   * 复用 forwardToOpenCode,因此走同一套出站/代理/请求头逻辑。
+   * 诊断请求不写 usage 统计(由 handleChat 负责记账,这里绕开),避免污染用量数据。
+   */
+  async apiTestModel(res, body) {
+    const label = this.proxyLabel();
+    const message = String(body.message || '').trim() || DEFAULT_TEST_MESSAGE;
+    const model = this.resolveModel(body.model); // 白名单内透传,否则回退固定模型
+    const t0 = Date.now();
+
+    this.logger('info', `[test] 模型对话测试 model=${model} proxy=${label} msg="${message}"`);
+
+    try {
+      const result = await this.forwardToOpenCode({
+        model,
+        messages: [{ role: 'user', content: message }],
+        stream: false,
+        max_tokens: TEST_MAX_TOKENS,
+      });
+      const reply = result?.choices?.[0]?.message?.content || '';
+      const usage = result?.usage || null;
+      this.logger('ok', `[test] 模型回复正常 ${Date.now() - t0}ms tokens=${usage?.total_tokens ?? 0}`);
+      return this.safe(res, 200, {
+        ok: true,
+        ms: Date.now() - t0,
+        status: 200,
+        type: label,
+        mode: 'model',
+        model,
+        message,
+        reply,
+        usage,
+      });
+    } catch (e) {
+      const status = e?.status || 0;
+      // 上游错误体可能是 JSON(如 429 的 FreeUsageLimitError),尽量提取可读信息
+      let detail = e?.body || e?.message || '未知错误';
+      try {
+        const parsed = JSON.parse(detail);
+        detail = parsed?.error?.message || parsed?.message || detail;
+      } catch { /* 非 JSON,原样返回 */ }
+      const error = status === 0 ? `上游连接失败: ${detail}` : `HTTP ${status}: ${detail}`;
+      this.logger('error', `[test] 模型对话测试失败 ${error}`);
+      return this.safe(res, 200, { ok: false, ms: Date.now() - t0, error, type: label, mode: 'model', model, message });
+    }
+  }
+
   // ---- /v1/models ----
   handleModels(res) {
     const data = this.getFreeModels().map(id => ({
@@ -424,11 +509,8 @@ class Gateway {
 
   // ---- /v1/chat/completions(单上游,429 透传 Retry-After)----
   async handleChat(req, res) {
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    let body;
-    try { body = JSON.parse(raw); }
-    catch { return this.safe(res, 400, { error: { message: 'Invalid JSON' } }); }
+    const body = await readJsonBody(req);
+    if (body === null) return this.safe(res, 400, { error: { message: 'Invalid JSON' } });
 
     body.model = this.resolveModel(body.model); // 白名单内模型透传,否则回退固定模型
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -482,10 +564,7 @@ class Gateway {
         path: url.pathname,
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'Accept': '*/*',
-          'User-Agent': OPENCODE_HEADERS['User-Agent'],
-          'X-Opencode-Client': OPENCODE_HEADERS['X-Opencode-Client'],
+          ...buildUpstreamHeaders(this.config),
           'Content-Length': Buffer.byteLength(bodyStr),
         },
         agent: this.buildAgent(),
@@ -523,10 +602,8 @@ class Gateway {
         path: url.pathname,
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
+          ...buildUpstreamHeaders(this.config),
           'Accept': 'text/event-stream',
-          'User-Agent': OPENCODE_HEADERS['User-Agent'],
-          'X-Opencode-Client': OPENCODE_HEADERS['X-Opencode-Client'],
           'Content-Length': Buffer.byteLength(bodyStr),
         },
         agent: this.buildAgent(),

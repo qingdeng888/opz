@@ -128,6 +128,15 @@ textarea {
 .msg.ok { color: var(--accent); }
 .divider { height: 1px; background: var(--border); margin: 16px 0; }
 code { background: var(--bg-input); border: 1px solid var(--border); padding: 1px 6px; border-radius: 5px; font-size: 12px; color: var(--info); }
+
+/* 模型回复展示 */
+.reply-box {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px; font-size: 13px; line-height: 1.7; color: var(--text-main);
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 320px; overflow-y: auto; margin-top: 6px;
+}
+.reply-box:empty::before { content: '(等待测试)'; color: var(--text-dim); }
 </style>
 </head>
 <body>
@@ -176,6 +185,16 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
       <input id="f-apikey" type="text" placeholder="zen-xxxx">
     </div>
     <div class="msg" id="msg-apikey"></div>
+  </div>
+
+  <div class="card">
+    <h2>上游 API Key</h2>
+    <div class="sub">opencode.ai 的 API Key(sk-xxx),网关转发时携带;留空则不带认证(免费模型需此 Key + 会话 ID)</div>
+    <div class="field full">
+      <label for="f-upstreamkey">上游 Key(sk-xxx)</label>
+      <input id="f-upstreamkey" type="password" placeholder="sk-xxxx,留空则不携带认证" autocomplete="off">
+    </div>
+    <div class="msg" id="msg-upstreamkey"></div>
   </div>
 
   <div class="card">
@@ -239,6 +258,42 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
   </div>
 
   <div class="card">
+    <h2>API 连通性测试</h2>
+    <div class="sub">基础连通只探测网络通路;模型对话会真实向上游发一条消息,验证所选模型能否作答</div>
+    <div style="height:12px;"></div>
+    <div class="row">
+      <div class="field">
+        <label for="f-test-type">测试类型</label>
+        <select id="f-test-type">
+          <option value="connect">基础连通性(探测上游接口)</option>
+          <option value="model">上游模型对话(真实请求)</option>
+        </select>
+      </div>
+      <div class="field" id="test-model-field" style="display:none;">
+        <label for="f-test-model">测试模型</label>
+        <select id="f-test-model"></select>
+      </div>
+    </div>
+    <div id="test-msg-field" style="display:none;">
+      <div class="field full">
+        <label for="f-test-message">测试消息(可自定义,默认:你是谁，出来干活了)</label>
+        <textarea id="f-test-message" rows="2"></textarea>
+      </div>
+      <div class="actions" style="margin-top:0;">
+        <button id="btn-test-reset" class="btn btn-ghost btn-sm">恢复默认消息</button>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="btn-test" class="btn btn-primary">开始测试</button>
+    </div>
+    <div class="msg" id="msg-test"></div>
+    <div id="test-reply-field" style="display:none;">
+      <label for="test-reply">模型回复</label>
+      <div class="reply-box" id="test-reply"></div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>管理密码</h2>
     <div class="sub">留空或填 ******** 表示保持当前密码不变</div>
     <div class="field" style="margin-top:12px;">
@@ -249,7 +304,6 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
 
   <div class="actions">
     <button id="btn-save" class="btn btn-primary">保存设置</button>
-    <button id="btn-test" class="btn btn-ghost">测试连接</button>
     <button id="btn-refresh" class="btn btn-ghost">刷新状态</button>
     <button id="btn-logout" class="btn btn-ghost">退出登录</button>
   </div>
@@ -259,6 +313,7 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
 <script>
 (function () {
   var TOKEN_KEY = 'zen_gw_token';
+  var DEFAULT_TEST_MESSAGE = '你是谁，出来干活了';
   var state = { config: null, stats: null, freeModels: [] };
 
   function el(id) { return document.getElementById(id); }
@@ -337,9 +392,11 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
       el('f-proxy-pass').value = j.proxy.password ? '********' : '';
       el('f-pool-lines').value = (j.proxy.pool || []).map(poolLine).join('\\n');
       el('f-adminpass').value = '';
+      el('f-upstreamkey').value = j.upstreamKey || '';
       el('st-port').textContent = j.port;
       state.freeModels = (j.freeModels || []).slice();
       renderModels();
+      renderTestModels();
       toggleProxyFields();
     }).catch(function (e) { el('msg-global').textContent = '加载配置失败: ' + e.message; });
   }
@@ -431,7 +488,8 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
     var payload = {
       apiKey: el('f-apikey').value.trim(),
       proxy: proxy,
-      freeModels: state.freeModels
+      freeModels: state.freeModels,
+      upstreamKey: el('f-upstreamkey').value
     };
     var adminPass = el('f-adminpass').value;
     if (adminPass) payload.adminPassword = adminPass; // 空/****** 保持原值
@@ -441,12 +499,14 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
     el('msg-proxy').textContent = '';
     el('msg-adminpass').textContent = '';
     el('msg-models').textContent = '';
+    el('msg-upstreamkey').textContent = '';
     el('btn-save').disabled = true;
     api('/api/config', { method: 'PUT', body: payload }).then(function (j) {
       var where = type === 'none' ? 'msg-apikey' : 'msg-proxy';
       if (type === 'none') el('msg-apikey').textContent = j.message || '已保存';
       else el('msg-proxy').textContent = j.message || '已保存';
       if (payload.adminPassword) el('msg-adminpass').textContent = '管理密码已更新';
+      if (payload.upstreamKey) el('msg-upstreamkey').textContent = '上游 Key 已更新';
       el('msg-models').textContent = '免费模型已同步 ' + j.config.freeModels.length + ' 个';
       return loadAll();
     }).catch(function (e) {
@@ -456,26 +516,84 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
     });
   });
 
-  // ---- 测试连接 ----
+  // ---- API 连通性测试 ----
+  // 测试模型下拉:跟随实际生效的免费模型白名单,重载后保留用户已选项
+  function renderTestModels() {
+    var sel = el('f-test-model');
+    var prev = sel.value;
+    sel.innerHTML = '';
+    state.freeModels.forEach(function (id) {
+      var opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = id;
+      sel.appendChild(opt);
+    });
+    if (prev && state.freeModels.indexOf(prev) >= 0) sel.value = prev;
+  }
+
+  // 仅「模型对话」模式需要选择模型与填写消息
+  function toggleTestFields() {
+    var isModel = el('f-test-type').value === 'model';
+    show('test-model-field', isModel);
+    show('test-msg-field', isModel);
+    if (!isModel) show('test-reply-field', false);
+  }
+  el('f-test-type').addEventListener('change', toggleTestFields);
+
+  el('btn-test-reset').addEventListener('click', function () {
+    el('f-test-message').value = DEFAULT_TEST_MESSAGE;
+    el('msg-test').textContent = '已恢复默认测试消息';
+    el('msg-test').className = 'msg';
+  });
+
   el('btn-test').addEventListener('click', function () {
     var btn = el('btn-test');
+    var type = el('f-test-type').value;
+    var msgEl = el('msg-test');
+    var payload = { type: type };
+    if (type === 'model') {
+      payload.model = el('f-test-model').value;
+      var custom = el('f-test-message').value.trim();
+      if (custom) payload.message = custom; // 留空则由服务端回退默认消息
+    }
+
     btn.disabled = true;
     btn.textContent = '测试中...';
-    el('msg-global').textContent = '';
-    api('/api/test', { method: 'POST', body: {} }).then(function (j) {
+    msgEl.textContent = '';
+    msgEl.className = 'msg';
+    show('test-reply-field', false);
+    el('test-reply').textContent = '';
+
+    api('/api/test', { method: 'POST', body: payload }).then(function (j) {
+      if (type !== 'model') {
+        if (j.ok) {
+          msgEl.textContent = '✅ 连通正常(' + (j.type || '?') + ') ' + j.ms + 'ms,上游 HTTP ' + j.status;
+          msgEl.className = 'msg ok';
+        } else {
+          msgEl.textContent = '❌ 连接失败: ' + (j.error || '未知错误') + '(' + j.ms + 'ms)';
+          msgEl.className = 'msg err';
+        }
+        return;
+      }
+      // 模型对话:展示回复正文与 token 用量
       if (j.ok) {
-        el('msg-global').textContent = '✅ 连通正常(' + (j.type || '?') + ') ' + j.ms + 'ms,上游 HTTP ' + j.status;
-        el('msg-global').className = 'msg ok';
+        var u = j.usage || {};
+        msgEl.textContent = '✅ 模型响应正常(' + (j.type || '?') + ') ' + j.ms + 'ms · ' + (j.model || '-') +
+          ' · tokens ' + (u.total_tokens || 0) +
+          '(入 ' + (u.prompt_tokens || 0) + ' / 出 ' + (u.completion_tokens || 0) + ')';
+        msgEl.className = 'msg ok';
+        el('test-reply').textContent = j.reply || '(模型返回空内容)';
+        show('test-reply-field', true);
       } else {
-        el('msg-global').textContent = '❌ 连接失败: ' + (j.error || '未知错误') + '(' + j.ms + 'ms)';
-        el('msg-global').className = 'msg err';
+        msgEl.textContent = '❌ 模型测试失败: ' + (j.error || '未知错误') + '(' + j.ms + 'ms)';
+        msgEl.className = 'msg err';
       }
     }).catch(function (e) {
-      el('msg-global').textContent = '测试失败: ' + e.message;
-      el('msg-global').className = 'msg err';
+      msgEl.textContent = '测试失败: ' + e.message;
+      msgEl.className = 'msg err';
     }).finally(function () {
       btn.disabled = false;
-      btn.textContent = '测试连接';
+      btn.textContent = '开始测试';
     });
   });
 
@@ -484,6 +602,10 @@ code { background: var(--bg-input); border: 1px solid var(--border); padding: 1p
     el('msg-global').textContent = '';
     Promise.all([loadConfig(), loadStats()]).catch(function () {});
   });
+
+  // 初始化测试卡片:填入默认消息,并按默认类型同步字段显隐
+  el('f-test-message').value = DEFAULT_TEST_MESSAGE;
+  toggleTestFields();
 
   // 首次进入:已登录则直接进主视图
   if (token()) enterMain();
